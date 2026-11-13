@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Environments
+.venv/
+.env
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+
+# Local credentials (real tokens always belong in the OS keyring)
+*.token.json

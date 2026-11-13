@@ -1,0 +1,55 @@
+[project]
+name = "colab-account-changer"
+version = "0.1.0"
+description = "A secure multi-account switcher for Google Colab CLI"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "google-auth>=2.49.1",
+    "keyring>=25.7.0",
+    "requests>=2.32.5",
+    "rich>=14.3.3",
+    "typer>=0.24.1",
+]
+
+[project.scripts]
+colab-account = "colab_account_changer.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/mizorewww/colab-account-changer"
+Repository = "https://github.com/mizorewww/colab-account-changer"
+Issues = "https://github.com/mizorewww/colab-account-changer/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/colab_account_changer"]
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
+    "pytest-mock>=3.17.0",
+    "ruff>=0.15.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
