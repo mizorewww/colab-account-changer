@@ -179,7 +179,9 @@ class AccountManager:
                 except TokenError as exc:
                     errors.append(f"Could not import {source} credential: {exc}")
                     continue
-                email = inspected.identity.email or self._token_account(raw)
+                # Only Google's verified identity may drive email-based merging.
+                # The optional JSON 'account' field is not an identity proof.
+                email = inspected.identity.email
                 by_email = next(
                     (
                         name
@@ -229,12 +231,6 @@ class AccountManager:
                     imported.append(profile)
             gcloud_accounts = self._read_gcloud_accounts() if include_gcloud else []
             return DiscoveryResult(discovered, imported, gcloud_accounts, errors)
-
-    @staticmethod
-    def _token_account(raw: str) -> str | None:
-        value = json.loads(raw)
-        account = value.get("account")
-        return account if isinstance(account, str) and "@" in account else None
 
     @staticmethod
     def _available_alias(label: str, profiles: dict[str, Any]) -> str:
@@ -380,19 +376,22 @@ class AccountManager:
         inspected = inspect_token(raw, verify=verify)
         existing = config["profiles"].get(name)
         previous_raw = self.credentials.read_profile(name) if existing else None
-        if (
-            existing
-            and previous_raw
-            and not verify
-            and not force
-            and inspected.token_json != previous_raw
-            and not shares_refresh_token(inspected.token_json, previous_raw)
-        ):
-            raise AccountError(
-                "Offline mode cannot verify that this credential belongs to "
-                f"profile {name!r}. Save online to verify its identity, or use "
-                "--force to replace the saved credential."
-            )
+        if existing and not verify and not force:
+            if previous_raw is None:
+                unverified_change = (
+                    token_fingerprint(inspected.token_json) != existing["token_sha256"]
+                )
+            else:
+                unverified_change = (
+                    inspected.token_json != previous_raw
+                    and not shares_refresh_token(inspected.token_json, previous_raw)
+                )
+            if unverified_change:
+                raise AccountError(
+                    "Offline mode cannot verify that this credential belongs to "
+                    f"profile {name!r}. Save online to verify its identity, or use "
+                    "--force to replace the saved credential."
+                )
         verified_email = inspected.identity.email
         if email and verified_email and email.casefold() != verified_email.casefold():
             raise AccountError(

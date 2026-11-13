@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from conftest import FakeKeyring, make_token
 
-from colab_account_changer.errors import AccountError, CredentialStoreError
+from colab_account_changer.errors import AccountError, ConfigError, CredentialStoreError
 from colab_account_changer.storage import ConfigStore, CredentialStore
 from colab_account_changer.tokens import Identity, InspectedToken
 from colab_account_changer.usage import Usage
@@ -81,6 +81,44 @@ def test_offline_save_rejects_a_different_refresh_credential_without_force(
     assert manager.config.load()["profiles"]["personal"]["email"] == "old@example.com"
 
 
+def test_offline_save_missing_vault_credential_cannot_reuse_old_identity(
+    manager, credentials
+):
+    manager.save("personal", email="old@example.com", verify=False)
+    credentials.delete_profile("personal")
+    credentials.write_colab(make_token("different-account"))
+
+    with pytest.raises(AccountError, match=r"cannot verify|offline"):
+        manager.save("personal", verify=False)
+
+    assert credentials.read_profile("personal") is None
+    assert manager.config.load()["profiles"]["personal"]["email"] == "old@example.com"
+
+
+def test_offline_save_can_restore_exact_missing_credential(manager, credentials):
+    manager.save("personal", email="old@example.com", verify=False)
+    original = credentials.read_profile("personal")
+    credentials.delete_profile("personal")
+
+    manager.save("personal", verify=False)
+
+    assert credentials.read_profile("personal") == original
+
+
+def test_offline_discovery_ignores_unverified_account_json_field(manager, credentials):
+    manager.save("personal", email="old@example.com", verify=False)
+    original = credentials.read_profile("personal")
+    value = json.loads(make_token("different-account"))
+    value["account"] = "old@example.com"
+    credentials.write_colab(json.dumps(value))
+
+    result = manager.discover(verify=False, include_gcloud=False)
+
+    assert credentials.read_profile("personal") == original
+    assert result.profiles[0].name == "current"
+    assert result.profiles[0].email is None
+
+
 def test_offline_save_accepts_same_refresh_token(manager, credentials):
     manager.save("personal", email="old@example.com", verify=False)
     refreshed = refreshed_copy(make_token("personal"), "new-access-token")
@@ -132,6 +170,28 @@ def test_failed_legacy_only_add_restores_empty_keyring(manager, credentials, tmp
     assert credentials.read_keyring_colab() is None
     assert credentials.read_colab() == make_token("legacy")
     assert legacy.read_text() == make_token("legacy")
+
+
+def test_config_rejects_profile_with_missing_email_field(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "active_profile": None,
+                "profiles": {
+                    "personal": {
+                        "created_at": "now",
+                        "updated_at": "now",
+                        "token_sha256": "0" * 64,
+                    }
+                },
+            }
+        )
+    )
+
+    with pytest.raises(ConfigError, match="email"):
+        ConfigStore(path).load()
 
 
 def test_custom_config_save_does_not_chmod_existing_parent(tmp_path):

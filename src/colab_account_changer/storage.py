@@ -122,7 +122,9 @@ class ConfigStore:
             if not isinstance(profile, dict):
                 raise ConfigError(f"Profile {name!r} has invalid metadata.")
             email = profile.get("email")
-            if email is not None and not isinstance(email, str):
+            if "email" not in profile or (
+                email is not None and not isinstance(email, str)
+            ):
                 raise ConfigError(f"Profile {name!r} has an invalid email.")
             digest = profile.get("token_sha256")
             if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
