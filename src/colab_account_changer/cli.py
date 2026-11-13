@@ -191,9 +191,7 @@ def _render_accounts(
 def list_accounts(
     with_usage: Annotated[
         bool,
-        typer.Option(
-            "--usage", help="Include live balance, hourly rate, and VM count."
-        ),
+        typer.Option("--usage", help="Refresh live usage and update the local cache."),
     ] = False,
     offline: OfflineOption = False,
     no_discover: Annotated[
@@ -201,7 +199,7 @@ def list_accounts(
         typer.Option("--no-discover", help="Only read existing changer profiles."),
     ] = False,
 ) -> None:
-    """Auto-discover and list Colab accounts, optionally with live usage."""
+    """List accounts with cached usage; optionally refresh it live."""
     manager = AccountManager()
     discovery = (
         None

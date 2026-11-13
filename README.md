@@ -4,12 +4,13 @@
 
 适配 [google-colab-cli](https://github.com/googlecolab/google-colab-cli) 的默认 `oauth2` 认证方式。自动读取系统钥匙串和旧版 `~/.config/colab-cli/token.json`，按 Google 邮箱生成账号别名，并可直接查询每个账号的计算单元余额与消耗速率。
 
-令牌只保存在操作系统钥匙串中。本地配置仅记录别名、邮箱、来源、时间和 SHA-256 摘要，**不记录访问令牌、刷新令牌或 client secret**。
+令牌只保存在操作系统钥匙串中。本地配置仅记录别名、邮箱、来源、时间、SHA-256 摘要和非敏感的 usage 缓存，**不记录访问令牌、刷新令牌或 client secret**。
 
 ## 功能
 
 - `sync` / `list`：自动发现并导入已有 OAuth 账号，相同邮箱自动去重。
-- `usage` / `list --usage`：直接查询余额、每小时消耗和活动分配数，无需切换账号。
+- `list`：直接展示上次缓存的余额、每小时消耗和活动分配数，不发 usage 请求。
+- `usage` / `list --usage`：在线刷新用量并更新缓存，无需切换账号。
 - `add`：保存当前账号后调用 Colab CLI 登录新账号；失败或 Ctrl-C 时恢复。
 - `use`：自动保存当前账号并切换；写入后回读校验，失败时回滚。
 - `save`：为当前登录指定自定义别名。
@@ -71,7 +72,7 @@ colab-account list --usage
 4. 将各账号凭据保存到独立的系统钥匙串条目。
 5. 使用每个凭据调用只读的 `GET /tun/m/ccu-info`，展示用量。
 
-示例列：`Alias`、`Email`、`Balance (CU)`、`CU/hr`、`VMs`。
+示例列：`Alias`、`Email`、`Balance (CU)`、`CU/hr`、`VMs`、`Cached`。普通 `list` 只读缓存；缓存不存在时显示 `—` / `never`。`list --usage` 和 `usage` 成功后更新缓存及查询时间。
 
 也可以分步执行：
 
@@ -79,7 +80,7 @@ colab-account list --usage
 # 只导入已有记录
 colab-account sync
 
-# 查看账号，不查询用量
+# 直接查看上次缓存的用量，不发起 usage 请求
 colab-account list
 
 # 查询活动账号或指定账号
@@ -193,7 +194,7 @@ colab-account remove work --yes
 export COLAB_ACCOUNT_CHANGER_CONFIG=/path/to/config.json
 ```
 
-usage 使用指定 profile 的 OAuth 凭据直接发送只读请求，不经过账号切换，也不创建运行时。profile 凭据缺失时会明确报错，不会回退到可能属于其他账号的当前令牌。网络错误不会直接展示可能包含令牌的请求 URL 或响应内容。
+usage 使用指定 profile 的 OAuth 凭据直接发送只读请求，不经过账号切换，也不创建运行时。profile 凭据缺失时会明确报错，不会回退到可能属于其他账号的当前令牌。成功结果缓存余额、速率、活动分配数和查询时间；同账号刷新凭据时保留缓存，强制更换身份时清除旧缓存。网络错误不会直接展示可能包含令牌的请求 URL 或响应内容。
 
 ## 开发
 
