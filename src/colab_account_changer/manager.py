@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import json
+import re
 import subprocess
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -13,7 +15,7 @@ from typing import Any
 
 from filelock import FileLock, Timeout
 
-from colab_account_changer.errors import AccountChangerError, AccountError
+from colab_account_changer.errors import AccountChangerError, AccountError, TokenError
 from colab_account_changer.storage import (
     ConfigStore,
     CredentialStore,
@@ -31,6 +33,15 @@ class Profile:
     token_sha256: str
     is_active: bool = False
     stored: bool = True
+    source: str = "manual"
+
+
+@dataclass(frozen=True)
+class DiscoveryResult:
+    profiles: list[Profile]
+    imported: list[Profile]
+    gcloud_accounts: list[str]
+    errors: list[str]
 
 
 @dataclass(frozen=True)
@@ -49,12 +60,14 @@ class AccountManager:
         config_store: ConfigStore | None = None,
         credentials: CredentialStore | None = None,
         runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+        gcloud_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
         colab_command: str = "colab",
         legacy_token_path: Callable[[], Path] | None = None,
     ) -> None:
         self.config = config_store or ConfigStore()
         self.credentials = credentials or CredentialStore()
         self.runner = runner or subprocess.run
+        self.gcloud_runner = gcloud_runner or subprocess.run
         self.colab_command = colab_command
         self.legacy_token_path = legacy_token_path or (
             lambda: Path.home() / ".config" / "colab-cli" / "token.json"
@@ -84,15 +97,189 @@ class AccountManager:
         return datetime.now(UTC).isoformat(timespec="seconds")
 
     @staticmethod
-    def _profile(name: str, metadata: dict[str, Any], **extra: bool) -> Profile:
+    def _profile(name: str, metadata: dict[str, Any], **extra: Any) -> Profile:
         return Profile(
             name=name,
             email=metadata.get("email"),
             created_at=metadata["created_at"],
             updated_at=metadata["updated_at"],
             token_sha256=metadata["token_sha256"],
+            source=metadata.get("source", "manual"),
             **extra,
         )
+
+    def discover(
+        self, *, verify: bool = True, include_gcloud: bool = True
+    ) -> DiscoveryResult:
+        """Import existing keyring/legacy tokens without changing Colab's login."""
+        with self._locked():
+            discovered: list[Profile] = []
+            imported: list[Profile] = []
+            errors: list[str] = []
+            keyring_raw = self.credentials.read_keyring_colab()
+            legacy_raw = self.credentials.read_legacy()
+            sources = []
+            if keyring_raw is not None:
+                sources.append(("keyring", keyring_raw, True))
+            if legacy_raw is not None and legacy_raw != keyring_raw:
+                sources.append(("legacy", legacy_raw, keyring_raw is None))
+
+            for source, raw, is_active in sources:
+                config = self.config.load()
+                digest = token_fingerprint(raw)
+                existing_name = next(
+                    (
+                        name
+                        for name, metadata in config["profiles"].items()
+                        if metadata["token_sha256"] == digest
+                    ),
+                    None,
+                )
+                if existing_name is not None:
+                    metadata = config["profiles"][existing_name]
+                    if self.credentials.read_profile(existing_name) != raw or (
+                        is_active and config["active_profile"] != existing_name
+                    ):
+                        profile = self._store_discovered(
+                            existing_name,
+                            raw,
+                            metadata.get("email"),
+                            source,
+                            is_active,
+                        )
+                    else:
+                        profile = self._profile(
+                            existing_name,
+                            metadata,
+                            is_active=is_active
+                            or config["active_profile"] == existing_name,
+                        )
+                    discovered.append(profile)
+                    continue
+
+                try:
+                    inspected = inspect_token(raw, verify=verify)
+                except TokenError as exc:
+                    errors.append(f"Could not import {source} credential: {exc}")
+                    continue
+                email = inspected.identity.email or self._token_account(raw)
+                by_email = next(
+                    (
+                        name
+                        for name, metadata in config["profiles"].items()
+                        if email
+                        and metadata.get("email")
+                        and metadata["email"].casefold() == email.casefold()
+                    ),
+                    None,
+                )
+                if by_email is not None and not is_active:
+                    if all(profile.name != by_email for profile in discovered):
+                        discovered.append(
+                            self._profile(
+                                by_email,
+                                config["profiles"][by_email],
+                                is_active=config["active_profile"] == by_email,
+                            )
+                        )
+                    continue
+                if by_email is not None:
+                    name = by_email
+                elif not email and is_active and config["active_profile"]:
+                    name = config["active_profile"]
+                else:
+                    name = self._available_alias(
+                        email or ("current" if source == "keyring" else "legacy"),
+                        config["profiles"],
+                    )
+                was_existing = name in config["profiles"]
+                profile = self._store_discovered(
+                    name, inspected.token_json, email, source, is_active
+                )
+                discovered.append(profile)
+                if not was_existing:
+                    imported.append(profile)
+            gcloud_accounts = self._read_gcloud_accounts() if include_gcloud else []
+            return DiscoveryResult(discovered, imported, gcloud_accounts, errors)
+
+    @staticmethod
+    def _token_account(raw: str) -> str | None:
+        value = json.loads(raw)
+        account = value.get("account")
+        return account if isinstance(account, str) and "@" in account else None
+
+    @staticmethod
+    def _available_alias(label: str, profiles: dict[str, Any]) -> str:
+        local_part = label.split("@", 1)[0].casefold()
+        base = re.sub(r"[^a-z0-9._-]+", "-", local_part).strip("._-")
+        base = (base or "account")[:48].strip("._-") or "account"
+        candidate = base
+        number = 2
+        while candidate in profiles:
+            suffix = f"-{number}"
+            candidate = f"{base[: 64 - len(suffix)]}{suffix}"
+            number += 1
+        return candidate
+
+    def _store_discovered(
+        self,
+        name: str,
+        raw: str,
+        email: str | None,
+        source: str,
+        is_active: bool,
+    ) -> Profile:
+        config = self.config.load()
+        existing = config["profiles"].get(name)
+        previous_raw = self.credentials.read_profile(name) if existing else None
+        self.credentials.write_profile(name, raw)
+        updated = copy.deepcopy(config)
+        now = self._now()
+        updated["profiles"][name] = {
+            "email": email or (existing.get("email") if existing else None),
+            "created_at": existing["created_at"] if existing else now,
+            "updated_at": now,
+            "token_sha256": token_fingerprint(raw),
+            "source": source,
+        }
+        if is_active:
+            updated["active_profile"] = name
+        try:
+            self.config.save(updated)
+        except BaseException:
+            self._restore_profile(name, previous_raw, existed=existing is not None)
+            raise
+        return self._profile(
+            name,
+            updated["profiles"][name],
+            is_active=updated["active_profile"] == name,
+        )
+
+    def _read_gcloud_accounts(self) -> list[str]:
+        try:
+            result = self.gcloud_runner(
+                ["gcloud", "auth", "list", "--format=json"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                return []
+            records = json.loads(result.stdout)
+            if not isinstance(records, list):
+                return []
+            return list(
+                dict.fromkeys(
+                    record["account"]
+                    for record in records
+                    if isinstance(record, dict)
+                    and isinstance(record.get("account"), str)
+                    and record["account"]
+                )
+            )
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+            return []
 
     def profiles(self) -> list[Profile]:
         config = self.config.load()

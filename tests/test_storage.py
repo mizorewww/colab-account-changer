@@ -58,6 +58,22 @@ def test_colab_credentials_use_the_upstream_keyring_entry(credentials, backend):
     assert credentials.read_colab() is None
 
 
+def test_legacy_token_is_a_read_only_fallback(tmp_path, backend):
+    legacy = tmp_path / "token.json"
+    legacy.write_text('{"refresh_token": "legacy-secret"}')
+    store = CredentialStore(backend=backend, legacy_path=legacy, timeout=0.1)
+
+    assert store.read_keyring_colab() is None
+    assert store.read_legacy() == '{"refresh_token": "legacy-secret"}'
+    assert store.read_colab() == '{"refresh_token": "legacy-secret"}'
+
+    store.write_colab('{"refresh_token": "keyring-secret"}')
+    assert store.read_colab() == '{"refresh_token": "keyring-secret"}'
+    store.delete_colab()
+    assert store.read_colab() == '{"refresh_token": "legacy-secret"}'
+    assert legacy.read_text() == '{"refresh_token": "legacy-secret"}'
+
+
 def test_profiles_are_separate_from_the_active_colab_credential(credentials, backend):
     credentials.write_profile("personal", "personal-token")
     credentials.write_profile("work", "work-token")

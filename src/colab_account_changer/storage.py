@@ -20,6 +20,7 @@ COLAB_USERNAME = "oauth_token"
 VAULT_SERVICE = "colab-account-changer"
 CONFIG_ENV = "COLAB_ACCOUNT_CHANGER_CONFIG"
 PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+DEFAULT_LEGACY_TOKEN_PATH = Path.home() / ".config" / "colab-cli" / "token.json"
 
 
 def validate_profile_name(name: str) -> str:
@@ -127,9 +128,19 @@ class ConfigStore:
 class CredentialStore:
     """Small, timeout-protected adapter around the OS keyring backend."""
 
-    def __init__(self, backend: Any = None, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        backend: Any = None,
+        timeout: float = 30.0,
+        legacy_path: Path | None = None,
+    ) -> None:
         self.backend = backend or keyring
         self.timeout = timeout
+        # Tests inject a fake backend and must never fall through to the host's
+        # real legacy token. Production uses the upstream path by default.
+        self.legacy_path = legacy_path or (
+            DEFAULT_LEGACY_TOKEN_PATH if backend is None else None
+        )
 
     def _call(self, operation: str, *args: str) -> str | None:
         result: list[str | None] = []
@@ -157,8 +168,21 @@ class CredentialStore:
             raise error
         return result[0]
 
-    def read_colab(self) -> str | None:
+    def read_keyring_colab(self) -> str | None:
         return self._call("get_password", COLAB_SERVICE, COLAB_USERNAME)
+
+    def read_legacy(self) -> str | None:
+        if self.legacy_path is None or not self.legacy_path.exists():
+            return None
+        try:
+            return self.legacy_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise CredentialStoreError(
+                f"Could not read legacy Colab token {self.legacy_path}: {exc}"
+            ) from exc
+
+    def read_colab(self) -> str | None:
+        return self.read_keyring_colab() or self.read_legacy()
 
     def write_colab(self, token_json: str) -> None:
         self._call("set_password", COLAB_SERVICE, COLAB_USERNAME, token_json)
