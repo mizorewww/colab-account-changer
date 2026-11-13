@@ -52,6 +52,9 @@ class ConfigStore:
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or default_config_path()
+        self._manage_parent_permissions = path is None and not os.environ.get(
+            CONFIG_ENV
+        )
 
     def load(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -67,8 +70,11 @@ class ConfigStore:
         self._validate(config)
         temporary_path: Path | None = None
         try:
+            parent_existed = self.path.parent.exists()
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            if os.name == "posix":
+            if os.name == "posix" and (
+                not parent_existed or self._manage_parent_permissions
+            ):
                 self.path.parent.chmod(0o700)
             descriptor, filename = tempfile.mkstemp(
                 prefix=f".{self.path.name}.", dir=self.path.parent
@@ -81,10 +87,11 @@ class ConfigStore:
                 os.fsync(file.fileno())
             if os.name == "posix":
                 temporary_path.chmod(0o600)
+            # The temporary file is already owner-only. After replace succeeds,
+            # do not perform fallible operations that would report a false failure
+            # for a configuration that has actually been committed.
             os.replace(temporary_path, self.path)
             temporary_path = None
-            if os.name == "posix":
-                self.path.chmod(0o600)
         except OSError as exc:
             raise ConfigError(
                 f"Could not save configuration {self.path}: {exc}"
@@ -126,7 +133,7 @@ class ConfigStore:
 
 
 class CredentialStore:
-    """Small, timeout-protected adapter around the OS keyring backend."""
+    """Keyring adapter with read timeouts and synchronous, safe mutations."""
 
     def __init__(
         self,
@@ -143,6 +150,19 @@ class CredentialStore:
         )
 
     def _call(self, operation: str, *args: str) -> str | None:
+        if operation in {"set_password", "delete_password"}:
+            # A timed-out daemon mutation could finish after rollback and undo it.
+            # Mutations therefore return only after the backend has actually
+            # finished. Read operations retain their timeout protection below.
+            try:
+                return getattr(self.backend, operation)(*args)
+            except PasswordDeleteError:
+                return None
+            except (KeyringError, OSError, RuntimeError) as error:
+                raise CredentialStoreError(
+                    f"Keyring operation failed: {error}"
+                ) from error
+
         result: list[str | None] = []
         errors: list[BaseException] = []
 

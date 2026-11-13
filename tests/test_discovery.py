@@ -1,7 +1,7 @@
 import json
 import subprocess
 
-from conftest import make_token
+from conftest import make_token, refreshed_token
 
 from colab_account_changer.tokens import Identity, InspectedToken
 
@@ -119,13 +119,15 @@ def test_discover_offline_reuses_active_alias_without_network(
     manager, credentials, mocker
 ):
     manager.save("custom", email="person@example.com", verify=False)
-    credentials.write_colab(make_token("refreshed"))
+    credentials.write_colab(refreshed_token("personal", "refreshed-access"))
     get = mocker.patch("colab_account_changer.tokens.requests.get")
 
     result = manager.discover(verify=False, include_gcloud=False)
 
     assert [profile.name for profile in result.profiles] == ["custom"]
-    assert credentials.read_profile("custom") == make_token("refreshed")
+    assert credentials.read_profile("custom") == refreshed_token(
+        "personal", "refreshed-access"
+    )
     assert result.profiles[0].email == "person@example.com"
     get.assert_not_called()
 

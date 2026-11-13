@@ -34,6 +34,24 @@ def token_fingerprint(token_json: str) -> str:
     return hashlib.sha256(token_json.encode("utf-8")).hexdigest()
 
 
+def shares_refresh_token(first: str, second: str) -> bool:
+    """Whether two JSON credentials contain the same non-empty refresh token."""
+    try:
+        left = json.loads(first)
+        right = json.loads(second)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    refresh_token = left.get("refresh_token")
+    return (
+        isinstance(refresh_token, str)
+        and bool(refresh_token)
+        and refresh_token == right.get("refresh_token")
+        and left.get("client_id") == right.get("client_id")
+    )
+
+
 def parse_token(token_json: str) -> dict[str, Any]:
     try:
         value = json.loads(token_json)

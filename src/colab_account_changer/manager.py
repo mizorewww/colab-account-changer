@@ -23,7 +23,11 @@ from colab_account_changer.storage import (
     CredentialStore,
     validate_profile_name,
 )
-from colab_account_changer.tokens import inspect_token, token_fingerprint
+from colab_account_changer.tokens import (
+    inspect_token,
+    shares_refresh_token,
+    token_fingerprint,
+)
 from colab_account_changer.usage import Usage, UsageService
 
 
@@ -132,35 +136,43 @@ class AccountManager:
             for source, raw, is_active in sources:
                 config = self.config.load()
                 digest = token_fingerprint(raw)
-                existing_name = next(
-                    (
-                        name
-                        for name, metadata in config["profiles"].items()
-                        if metadata["token_sha256"] == digest
-                    ),
-                    None,
+                active = config["active_profile"]
+                existing_name = (
+                    active
+                    if active and config["profiles"][active]["token_sha256"] == digest
+                    else next(
+                        (
+                            name
+                            for name, metadata in config["profiles"].items()
+                            if metadata["token_sha256"] == digest
+                        ),
+                        None,
+                    )
                 )
                 if existing_name is not None:
                     metadata = config["profiles"][existing_name]
-                    if self.credentials.read_profile(existing_name) != raw or (
-                        is_active and config["active_profile"] != existing_name
-                    ):
-                        profile = self._store_discovered(
-                            existing_name,
-                            raw,
-                            metadata.get("email"),
-                            source,
-                            is_active,
-                        )
-                    else:
-                        profile = self._profile(
-                            existing_name,
-                            metadata,
-                            is_active=is_active
-                            or config["active_profile"] == existing_name,
-                        )
-                    discovered.append(profile)
-                    continue
+                    # A token first imported offline still needs one online
+                    # identity lookup, even though its digest has not changed.
+                    if metadata.get("email") or not verify:
+                        if self.credentials.read_profile(existing_name) != raw or (
+                            is_active and config["active_profile"] != existing_name
+                        ):
+                            profile = self._store_discovered(
+                                existing_name,
+                                raw,
+                                metadata.get("email"),
+                                source,
+                                is_active,
+                            )
+                        else:
+                            profile = self._profile(
+                                existing_name,
+                                metadata,
+                                is_active=is_active
+                                or config["active_profile"] == existing_name,
+                            )
+                        discovered.append(profile)
+                        continue
 
                 try:
                     inspected = inspect_token(raw, verify=verify)
@@ -190,7 +202,18 @@ class AccountManager:
                     continue
                 if by_email is not None:
                     name = by_email
-                elif not email and is_active and config["active_profile"]:
+                elif existing_name is not None:
+                    name = existing_name
+                elif (
+                    not email
+                    and is_active
+                    and config["active_profile"]
+                    and self.credentials.read_profile(config["active_profile"])
+                    and shares_refresh_token(
+                        raw,
+                        self.credentials.read_profile(config["active_profile"]),
+                    )
+                ):
                     name = config["active_profile"]
                 else:
                     name = self._available_alias(
@@ -323,8 +346,6 @@ class AccountManager:
         if name not in config["profiles"]:
             raise AccountError(f"Profile {name!r} does not exist.")
         raw = self.credentials.read_profile(name)
-        if raw is None and config["active_profile"] == name:
-            raw = self.credentials.read_colab()
         if raw is None:
             raise AccountError(f"Profile {name!r} has no saved credential.")
         return self.usage_service.fetch(raw)
@@ -358,6 +379,20 @@ class AccountManager:
             )
         inspected = inspect_token(raw, verify=verify)
         existing = config["profiles"].get(name)
+        previous_raw = self.credentials.read_profile(name) if existing else None
+        if (
+            existing
+            and previous_raw
+            and not verify
+            and not force
+            and inspected.token_json != previous_raw
+            and not shares_refresh_token(inspected.token_json, previous_raw)
+        ):
+            raise AccountError(
+                "Offline mode cannot verify that this credential belongs to "
+                f"profile {name!r}. Save online to verify its identity, or use "
+                "--force to replace the saved credential."
+            )
         verified_email = inspected.identity.email
         if email and verified_email and email.casefold() != verified_email.casefold():
             raise AccountError(
@@ -380,7 +415,6 @@ class AccountManager:
             )
 
         now = self._now()
-        previous_raw = self.credentials.read_profile(name) if existing else None
         self.credentials.write_profile(name, inspected.token_json)
         updated = copy.deepcopy(config)
         updated["profiles"][name] = {
@@ -415,7 +449,9 @@ class AccountManager:
             config = self.config.load()
             if name not in config["profiles"]:
                 raise AccountError(f"Profile {name!r} does not exist.")
-            original = self.credentials.read_colab()
+            original_keyring = self.credentials.read_keyring_colab()
+            original = original_keyring or self.credentials.read_legacy()
+            original_legacy_only = original_keyring is None and original is not None
             active = config["active_profile"]
 
             if original is not None and active == name:
@@ -472,7 +508,7 @@ class AccountManager:
                 updated["active_profile"] = name
                 self.config.save(updated)
             except BaseException as exc:
-                self._restore_colab(original, exc)
+                self._restore_colab(original, exc, legacy_only=original_legacy_only)
                 raise
             return self._profile(
                 name, self.config.load()["profiles"][name], is_active=True
@@ -498,7 +534,9 @@ class AccountManager:
             config = self.config.load()
             if name in config["profiles"]:
                 raise AccountError(f"Profile {name!r} already exists.")
-            original = self.credentials.read_colab()
+            original_keyring = self.credentials.read_keyring_colab()
+            original = original_keyring or self.credentials.read_legacy()
+            original_legacy_only = original_keyring is None and original is not None
             if original is not None:
                 active = config["active_profile"]
                 if active is None:
@@ -563,7 +601,7 @@ class AccountManager:
                 self.config.save(updated)
                 return self._profile(name, updated["profiles"][name], is_active=True)
             except BaseException as exc:
-                self._restore_colab(original, exc)
+                self._restore_colab(original, exc, legacy_only=original_legacy_only)
                 if created_profile:
                     self.credentials.delete_profile(name)
                 raise
@@ -600,9 +638,15 @@ class AccountManager:
         else:
             self.credentials.delete_profile(name)
 
-    def _restore_colab(self, original: str | None, error: BaseException) -> None:
+    def _restore_colab(
+        self,
+        original: str | None,
+        error: BaseException,
+        *,
+        legacy_only: bool = False,
+    ) -> None:
         try:
-            if original is None:
+            if original is None or legacy_only:
                 self.credentials.delete_colab()
             else:
                 self.credentials.write_colab(original)

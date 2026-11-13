@@ -21,6 +21,12 @@ def make_token(marker="account"):
     )
 
 
+def refreshed_token(marker="account", access_token="new-access-token"):
+    value = json.loads(make_token(marker))
+    value["token"] = access_token
+    return json.dumps(value)
+
+
 class FakeKeyring:
     def __init__(self):
         self.secrets = {}

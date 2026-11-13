@@ -2,7 +2,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from conftest import make_token
+from conftest import make_token, refreshed_token
 
 from colab_account_changer.errors import AccountError, ConfigError, TokenError
 from colab_account_changer.storage import COLAB_SERVICE, COLAB_USERNAME
@@ -70,7 +70,8 @@ def test_use_switches_and_automatically_saves_the_current_profile(
     manager.save("personal", email="person@example.com", verify=False)
     credentials.write_colab(make_token("work"))
     manager.save("work", email="work@example.com", verify=False)
-    credentials.write_colab(make_token("personal-refreshed"))
+    refreshed = refreshed_token("personal", "personal-refreshed-access")
+    credentials.write_colab(refreshed)
     config = config_store.load()
     config["active_profile"] = "personal"
     config_store.save(config)
@@ -79,7 +80,7 @@ def test_use_switches_and_automatically_saves_the_current_profile(
 
     assert profile.name == "work"
     assert credentials.read_colab() == make_token("work")
-    assert credentials.read_profile("personal") == make_token("personal-refreshed")
+    assert credentials.read_profile("personal") == refreshed
     assert config_store.load()["active_profile"] == "work"
 
 
@@ -200,12 +201,13 @@ def test_use_no_save_keeps_tracked_profiles_previous_copy(
 
 def test_using_current_profile_preserves_a_refreshed_active_token(manager, credentials):
     manager.save("personal", verify=False)
-    credentials.write_colab(make_token("personal-refreshed"))
+    refreshed = refreshed_token("personal", "personal-refreshed-access")
+    credentials.write_colab(refreshed)
 
     manager.use("personal", verify=False)
 
-    assert credentials.read_colab() == make_token("personal-refreshed")
-    assert credentials.read_profile("personal") == make_token("personal-refreshed")
+    assert credentials.read_colab() == refreshed
+    assert credentials.read_profile("personal") == refreshed
 
 
 def test_remove_deletes_inactive_profile_but_not_active_one(manager, credentials):
