@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Annotated
 
 import typer
@@ -85,6 +86,23 @@ def _discover(
     return result
 
 
+def _cache_age(timestamp: str | None) -> str:
+    if not timestamp:
+        return "never"
+    try:
+        fetched = datetime.fromisoformat(timestamp)
+        seconds = max(0, int((datetime.now(UTC) - fetched).total_seconds()))
+    except (TypeError, ValueError):
+        return "cached"
+    if seconds < 60:
+        return "now"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
 def _render_accounts(
     manager: AccountManager,
     *,
@@ -118,45 +136,32 @@ def _render_accounts(
         table.add_column("", width=2)
         table.add_column("Alias", style="bold", overflow="fold")
         table.add_column("Email", overflow="fold")
-        if with_usage:
-            table.add_column("Balance (CU)", justify="right")
-            table.add_column("CU/hr", justify="right")
-            table.add_column("VMs", justify="right")
-        else:
-            table.add_column("Source", style="dim")
-            table.add_column("Credential")
-            table.add_column("Updated", style="dim")
+        table.add_column("Balance (CU)", justify="right")
+        table.add_column("CU/hr", justify="right")
+        table.add_column("VMs", justify="right")
+        table.add_column("Cached", style="dim")
         for profile in profiles:
+            usage = usage_values.get(profile.name) if with_usage else profile.usage
+            cached_at = (
+                "just now"
+                if profile.name in usage_values
+                else _cache_age(profile.usage_fetched_at)
+            )
             row = [
                 Text("●", style="green") if profile.is_active else Text(""),
                 Text(profile.name),
                 Text(profile.email or "Not verified"),
+                Text(f"{usage.balance:.2f}")
+                if usage
+                else Text("error" if profile.name in usage_errors else "—"),
+                Text(f"{usage.hourly_rate:.2f}") if usage else Text("—"),
+                Text(str(usage.assignments)) if usage else Text("—"),
+                Text(cached_at),
             ]
-            if with_usage:
-                usage = usage_values.get(profile.name)
-                row.extend(
-                    [
-                        Text(f"{usage.balance:.2f}")
-                        if usage
-                        else Text("error" if profile.name in usage_errors else "—"),
-                        Text(f"{usage.hourly_rate:.2f}") if usage else Text("—"),
-                        Text(str(usage.assignments)) if usage else Text("—"),
-                    ]
-                )
-            else:
-                row.extend(
-                    [
-                        Text(profile.source),
-                        Text("saved", style="green")
-                        if profile.stored
-                        else Text("missing", style="red"),
-                        Text(profile.updated_at[:10]),
-                    ]
-                )
             table.add_row(*row)
         console.print(table)
         console.print(
-            "[dim]● Active profile for the default Colab CLI OAuth provider.[/dim]"
+            "[dim]● Active profile. Usage is cached; use --usage to refresh.[/dim]"
         )
     for name, message in usage_errors.items():
         error_console.print(

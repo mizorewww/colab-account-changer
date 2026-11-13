@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
@@ -132,6 +133,31 @@ class ConfigStore:
             for field in ("created_at", "updated_at"):
                 if not isinstance(profile.get(field), str):
                     raise ConfigError(f"Profile {name!r} is missing {field}.")
+            usage = profile.get("usage")
+            if usage is not None:
+                if not isinstance(usage, dict):
+                    raise ConfigError(f"Profile {name!r} has invalid usage cache.")
+                for field in ("balance", "hourly_rate"):
+                    value = usage.get(field)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(value)
+                    ):
+                        raise ConfigError(
+                            f"Profile {name!r} has invalid usage {field}."
+                        )
+                assignments = usage.get("assignments")
+                if (
+                    isinstance(assignments, bool)
+                    or not isinstance(assignments, int)
+                    or assignments < 0
+                ):
+                    raise ConfigError(
+                        f"Profile {name!r} has invalid usage assignments."
+                    )
+                if not isinstance(usage.get("fetched_at"), str):
+                    raise ConfigError(f"Profile {name!r} has invalid usage timestamp.")
 
 
 class CredentialStore:

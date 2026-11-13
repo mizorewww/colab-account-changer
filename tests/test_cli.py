@@ -60,7 +60,7 @@ def test_save_and_list_accounts(cli_manager):
     assert result.exit_code == 0
     assert "personal" in result.stdout
     assert "person@example.com" in result.stdout
-    assert "saved" in result.stdout
+    assert "never" in result.stdout
 
 
 def test_list_auto_discovers_and_imports_existing_account(cli_manager, mocker):
@@ -76,8 +76,8 @@ def test_list_auto_discovers_and_imports_existing_account(cli_manager, mocker):
     assert result.exit_code == 0
     assert "person" in result.stdout
     assert "person@example.com" in result.stdout
-    assert "keyring" in result.stdout
     assert cli_manager.config.load()["active_profile"] == "person"
+    assert cli_manager.config.load()["profiles"]["person"]["source"] == "keyring"
 
 
 def test_sync_offline_imports_without_calling_google(cli_manager, mocker):
@@ -129,6 +129,25 @@ def test_list_usage_queries_each_profile_without_switching(
     assert "usage denied" in result.stderr
     assert credentials.read_keyring_colab() == make_token("work")
     assert cli_manager.config.load()["active_profile"] == "work"
+    assert (
+        cli_manager.config.load()["profiles"]["personal"]["usage"]["balance"] == 100.0
+    )
+
+
+def test_list_uses_cached_usage_without_fetching(cli_manager, mocker):
+    cli_manager.save("personal", email="person@example.com", verify=False)
+    cli_manager.usage_service = mocker.Mock()
+    cli_manager.usage_service.fetch.return_value = Usage(123.45, 0.67, 2)
+    cli_manager.usage("personal")
+    cli_manager.usage_service.fetch.reset_mock()
+
+    result = runner.invoke(app, ["list", "--no-discover"])
+
+    assert result.exit_code == 0
+    assert "123.45" in result.stdout
+    assert "0.67" in result.stdout
+    assert "never" not in result.stdout
+    cli_manager.usage_service.fetch.assert_not_called()
 
 
 def test_offline_email_labels_are_rendered_literally(cli_manager):

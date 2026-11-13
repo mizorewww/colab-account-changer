@@ -138,8 +138,43 @@ def test_existing_legacy_record_is_auto_discovered_without_modification(isolated
     config = json.loads((tmp_path / "config.json").read_text())
     assert config["active_profile"] == "legacy"
     assert config["profiles"]["legacy"]["source"] == "legacy"
+    config["profiles"]["legacy"]["usage"] = {
+        "balance": 12.5,
+        "hourly_rate": 0.75,
+        "assignments": 1,
+        "fetched_at": "2026-01-01T00:00:00+00:00",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    listed = invoke("list", "--no-discover")
+    assert listed.returncode == 0, listed.stderr
+    assert "12.50" in listed.stdout
+    assert "0.75" in listed.stdout
     assert "fake-refresh-legacy" not in (tmp_path / "config.json").read_text()
     assert "fake-access-legacy" in legacy.read_text()
+
+
+def test_add_with_legacy_file_uses_keyring_and_preserves_original_file(isolated_cli):
+    invoke, tmp_path, fake_colab = isolated_cli
+    assert invoke("--auth=oauth2", "whoami", colab=True).returncode == 0
+    original = json.loads((tmp_path / "keyring.json").read_text())[
+        "google-colab-cli\0oauth_token"
+    ]
+    legacy = tmp_path / "home/.config/colab-cli/token.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(original)
+    assert invoke("save", "personal", "--offline").returncode == 0
+
+    (tmp_path / "next-login.txt").write_text("work")
+    added = invoke("add", "work", "--offline", "--colab-command", str(fake_colab))
+
+    assert added.returncode == 0, added.stderr
+    secrets = json.loads((tmp_path / "keyring.json").read_text())
+    assert "fake-access-work" in secrets["google-colab-cli\0oauth_token"]
+    assert "fake-access-work" in secrets["colab-account-changer\0work"]
+    assert json.loads((tmp_path / "config.json").read_text())["active_profile"] == (
+        "work"
+    )
+    assert legacy.read_text() == original
 
 
 def test_failed_new_login_restores_original_in_real_cli_process(isolated_cli):

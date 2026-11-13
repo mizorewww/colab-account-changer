@@ -41,6 +41,8 @@ class Profile:
     is_active: bool = False
     stored: bool = True
     source: str = "manual"
+    usage: Usage | None = None
+    usage_fetched_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,16 @@ class AccountManager:
 
     @staticmethod
     def _profile(name: str, metadata: dict[str, Any], **extra: Any) -> Profile:
+        cached = metadata.get("usage")
+        usage = (
+            Usage(
+                balance=cached["balance"],
+                hourly_rate=cached["hourly_rate"],
+                assignments=cached["assignments"],
+            )
+            if cached
+            else None
+        )
         return Profile(
             name=name,
             email=metadata.get("email"),
@@ -114,6 +126,8 @@ class AccountManager:
             updated_at=metadata["updated_at"],
             token_sha256=metadata["token_sha256"],
             source=metadata.get("source", "manual"),
+            usage=usage,
+            usage_fetched_at=cached.get("fetched_at") if cached else None,
             **extra,
         )
 
@@ -266,6 +280,8 @@ class AccountManager:
             "token_sha256": token_fingerprint(raw),
             "source": source,
         }
+        if existing and existing.get("usage"):
+            updated["profiles"][name]["usage"] = copy.deepcopy(existing["usage"])
         if is_active:
             updated["active_profile"] = name
         try:
@@ -330,21 +346,31 @@ class AccountManager:
         return CurrentStatus(active, email, True, saved == raw)
 
     def usage(self, name: str | None = None) -> Usage:
-        """Fetch one account's usage without modifying the active credential."""
-        config = self.config.load()
-        name = name or config["active_profile"]
-        if name is None:
-            raw = self.credentials.read_colab()
+        """Fetch and cache usage without modifying the active credential."""
+        with self._locked():
+            config = self.config.load()
+            name = name or config["active_profile"]
+            if name is None:
+                raw = self.credentials.read_colab()
+                if raw is None:
+                    raise AccountError("No active Colab OAuth credential was found.")
+                return self.usage_service.fetch(raw)
+            name = self._name(name)
+            if name not in config["profiles"]:
+                raise AccountError(f"Profile {name!r} does not exist.")
+            raw = self.credentials.read_profile(name)
             if raw is None:
-                raise AccountError("No active Colab OAuth credential was found.")
-            return self.usage_service.fetch(raw)
-        name = self._name(name)
-        if name not in config["profiles"]:
-            raise AccountError(f"Profile {name!r} does not exist.")
-        raw = self.credentials.read_profile(name)
-        if raw is None:
-            raise AccountError(f"Profile {name!r} has no saved credential.")
-        return self.usage_service.fetch(raw)
+                raise AccountError(f"Profile {name!r} has no saved credential.")
+            usage = self.usage_service.fetch(raw)
+            updated = copy.deepcopy(config)
+            updated["profiles"][name]["usage"] = {
+                "balance": usage.balance,
+                "hourly_rate": usage.hourly_rate,
+                "assignments": usage.assignments,
+                "fetched_at": self._now(),
+            }
+            self.config.save(updated)
+            return usage
 
     def save(
         self,
@@ -422,6 +448,8 @@ class AccountManager:
             "updated_at": now,
             "token_sha256": token_fingerprint(inspected.token_json),
         }
+        if existing and not force and existing.get("usage"):
+            updated["profiles"][name]["usage"] = copy.deepcopy(existing["usage"])
         updated["active_profile"] = name
         try:
             self.config.save(updated)
