@@ -96,6 +96,63 @@ colab-account usage work
 
 A plain `list` shows the balance, consumption rate, active assignments, and cache age. Missing values are shown as `—` and `never`.
 
+## Resource pool
+
+A Colab session is visible only to the account that created it, and running `colab sessions`/`colab exec` under another account makes Colab CLI prune the "invisible" local record. The resource pool treats your accounts as one pool: create, use, and stop machines by **session name** only. `colab-pool` is the same as `colab-account pool`.
+
+```bash
+# Create: pick an account and register (colab new options follow the name)
+colab-pool new node-x --gpu g4
+colab-pool new node-y --account work      # choose the account
+
+# Use by name: switches to the owning account; args, stdin, exit codes pass through
+colab-pool exec node-x -f train.py
+echo 'print(1)' | colab-pool exec node-x
+colab-pool upload node-x data.tgz /content/data.tgz
+colab-pool cmd edit node-x /content/a.py  # any colab subcommand that takes -s
+
+# Stop and deregister (also works if the server already dropped it)
+colab-pool stop node-x
+
+# Registry + balance/rate/VMs per account + primary account
+colab-pool list
+colab-pool list --json --cached
+```
+
+Account choice: the pool sticks to a primary account and only moves to the account with the highest balance (and pins it) when the primary drops below a threshold (default 5 CU).
+
+```bash
+colab-pool primary                 # show
+colab-pool primary work --threshold 3
+```
+
+Reconcile and clean up:
+
+```bash
+# Compare with the servers: unregistered VMs (orphans) and vanished sessions; exit 1 on mismatch
+colab-pool reconcile               # pooled accounts + accounts whose usage shows VMs
+colab-pool reconcile --all --json  # probe every account
+
+# Stop an orphan VM (asks first; --yes skips)
+colab-pool reap work gpu-t4-s-xxxxxxxx
+
+# Register a session created outside the pool
+colab-pool adopt node-z work /path/to/sessions.json
+
+# Import from the prototype pool script (read-only; original files untouched)
+colab-pool import /path/to/tools/pool.json
+```
+
+The prototype script uses its own separate lock; stop using it after importing.
+
+How it works:
+
+- The registry `pool.json` and one session-state file per account, `pool-state/ACCOUNT.json`, live next to `config.json`, owner-only and written atomically. No tokens are stored by the pool.
+- Every command takes the account lock (the same `config.lock` used by `colab-account use`), switches to the owning account, runs `colab --config pool-state/ACCOUNT.json SUB -s NAME ...`, then releases the lock. Concurrent commands queue up and each runs under the right account.
+- A lock wait that times out (default 600 s, `--lock-timeout` or `COLAB_POOL_LOCK_TIMEOUT`) exits with code 75, so it is safe to retry.
+- Others wait while the lock is held: keep commands short, run long jobs with `nohup` on the VM and poll briefly. `repl`/`ssh` hold the lock for the whole interactive session.
+- `--offline` (or `COLAB_POOL_OFFLINE=1`) skips online identity checks when switching; `--cached` on `new`, `list`, and `reconcile` uses cached balances.
+
 ## Common commands
 
 | Command | Purpose |
@@ -109,6 +166,11 @@ A plain `list` shows the balance, consumption rate, active assignments, and cach
 | `colab-account save NAME` | Save the active account under an alias |
 | `colab-account usage [NAME]` | Refresh usage for the active or named account |
 | `colab-account remove NAME` | Remove an inactive account |
+| `colab-pool new NAME` | Create a pooled session |
+| `colab-pool exec NAME ...` | Run on a session under its owning account |
+| `colab-pool stop NAME` | Stop and deregister a session |
+| `colab-pool list` | Show sessions, balances, and the primary account |
+| `colab-pool reconcile` | Find orphan and vanished sessions |
 
 ## Offline operations
 
@@ -144,5 +206,5 @@ colab-account remove work --yes
 
 - Only the Colab CLI's default OAuth2 credentials are managed. ADC and gcloud logins are not switched.
 - Credentials are stored in the operating system keyring. The legacy `token.json` is read-only and is not modified.
-- Switching accounts does not stop, create, or migrate Colab VMs.
+- Switching accounts does not stop, create, or migrate Colab VMs; use the resource pool to manage VMs by name.
 - To clean up runtimes before switching, use `colab sessions` and `colab stop` yourself.
