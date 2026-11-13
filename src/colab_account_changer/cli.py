@@ -116,24 +116,21 @@ def _render_accounts(
     else:
         table = Table(title="Colab accounts", box=box.ROUNDED, header_style="bold cyan")
         table.add_column("", width=2)
-        table.add_column("Alias", style="bold")
-        table.add_column("Email")
-        table.add_column("Source", style="dim")
-        table.add_column("Credential")
+        table.add_column("Alias", style="bold", overflow="fold")
+        table.add_column("Email", overflow="fold")
         if with_usage:
             table.add_column("Balance (CU)", justify="right")
             table.add_column("CU/hr", justify="right")
             table.add_column("VMs", justify="right")
-        table.add_column("Updated", style="dim")
+        else:
+            table.add_column("Source", style="dim")
+            table.add_column("Credential")
+            table.add_column("Updated", style="dim")
         for profile in profiles:
             row = [
                 Text("●", style="green") if profile.is_active else Text(""),
                 Text(profile.name),
                 Text(profile.email or "Not verified"),
-                Text(profile.source),
-                Text("saved", style="green")
-                if profile.stored
-                else Text("missing", style="red"),
             ]
             if with_usage:
                 usage = usage_values.get(profile.name)
@@ -146,7 +143,16 @@ def _render_accounts(
                         Text(str(usage.assignments)) if usage else Text("—"),
                     ]
                 )
-            row.append(Text(profile.updated_at.replace("T", " ")[:19]))
+            else:
+                row.extend(
+                    [
+                        Text(profile.source),
+                        Text("saved", style="green")
+                        if profile.stored
+                        else Text("missing", style="red"),
+                        Text(profile.updated_at[:10]),
+                    ]
+                )
             table.add_row(*row)
         console.print(table)
         console.print(
