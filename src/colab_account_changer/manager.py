@@ -17,7 +17,12 @@ from typing import Any
 
 from filelock import FileLock, Timeout
 
-from colab_account_changer.errors import AccountChangerError, AccountError, TokenError
+from colab_account_changer.errors import (
+    AccountChangerError,
+    AccountError,
+    LockTimeoutError,
+    TokenError,
+)
 from colab_account_changer.storage import (
     ConfigStore,
     CredentialStore,
@@ -83,18 +88,39 @@ class AccountManager:
         self.legacy_token_path = legacy_token_path or (
             lambda: Path.home() / ".config" / "colab-cli" / "token.json"
         )
+        self._file_lock: FileLock | None = None
+
+    @property
+    def lock_path(self) -> Path:
+        return self.config.path.with_suffix(".lock")
+
+    @contextmanager
+    def exclusive(self, timeout: float = 10.0, message: str | None = None):
+        """Hold the account lock; re-entrant within this manager and thread.
+
+        Callers (such as the resource pool) may hold it across several account
+        operations and subprocesses; nested manager calls reuse the same lock
+        instead of deadlocking on a second file descriptor.
+        """
+        self.config.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if self._file_lock is None:
+            self._file_lock = FileLock(self.lock_path)
+        try:
+            self._file_lock.acquire(timeout=timeout)
+        except Timeout as exc:
+            raise LockTimeoutError(
+                message
+                or "Another account operation is still running. Try again later."
+            ) from exc
+        try:
+            yield
+        finally:
+            self._file_lock.release()
 
     @contextmanager
     def _locked(self):
-        self.config.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        lock = FileLock(self.config.path.with_suffix(".lock"), timeout=10)
-        try:
-            with lock:
-                yield
-        except Timeout as exc:
-            raise AccountError(
-                "Another account operation is still running. Try again later."
-            ) from exc
+        with self.exclusive():
+            yield
 
     @staticmethod
     def _name(name: str) -> str:

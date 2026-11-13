@@ -19,3 +19,13 @@ class TokenError(AccountChangerError):
 
 class AccountError(AccountChangerError):
     """An account operation cannot be completed safely."""
+
+
+class LockTimeoutError(AccountError):
+    """Another process held the account lock for longer than allowed."""
+
+    exit_code = 75  # EX_TEMPFAIL: safe to retry later.
+
+
+class PoolError(AccountChangerError):
+    """A resource-pool operation cannot be completed safely."""

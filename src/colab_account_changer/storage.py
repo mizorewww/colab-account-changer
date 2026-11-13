@@ -34,6 +34,39 @@ def validate_profile_name(name: str) -> str:
     return name
 
 
+def write_private_json(
+    path: Path, value: Any, *, manage_parent_permissions: bool = False
+) -> None:
+    """Atomically replace ``path`` with owner-only JSON (directory is 0700)."""
+    temporary_path: Path | None = None
+    try:
+        parent_existed = path.parent.exists()
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name == "posix" and (not parent_existed or manage_parent_permissions):
+            path.parent.chmod(0o700)
+        descriptor, filename = tempfile.mkstemp(
+            prefix=f".{path.name}.", dir=path.parent
+        )
+        temporary_path = Path(filename)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            json.dump(value, file, indent=2, sort_keys=True, ensure_ascii=False)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        if os.name == "posix":
+            temporary_path.chmod(0o600)
+        # The temporary file is already owner-only. After replace succeeds,
+        # do not perform fallible operations that would report a false failure
+        # for a configuration that has actually been committed.
+        os.replace(temporary_path, path)
+        temporary_path = None
+    except OSError as exc:
+        raise ConfigError(f"Could not save configuration {path}: {exc}") from exc
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def default_config() -> dict[str, Any]:
     return {"version": 1, "active_profile": None, "profiles": {}}
 
@@ -69,37 +102,9 @@ class ConfigStore:
 
     def save(self, config: dict[str, Any]) -> None:
         self._validate(config)
-        temporary_path: Path | None = None
-        try:
-            parent_existed = self.path.parent.exists()
-            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            if os.name == "posix" and (
-                not parent_existed or self._manage_parent_permissions
-            ):
-                self.path.parent.chmod(0o700)
-            descriptor, filename = tempfile.mkstemp(
-                prefix=f".{self.path.name}.", dir=self.path.parent
-            )
-            temporary_path = Path(filename)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-                json.dump(config, file, indent=2, sort_keys=True, ensure_ascii=False)
-                file.write("\n")
-                file.flush()
-                os.fsync(file.fileno())
-            if os.name == "posix":
-                temporary_path.chmod(0o600)
-            # The temporary file is already owner-only. After replace succeeds,
-            # do not perform fallible operations that would report a false failure
-            # for a configuration that has actually been committed.
-            os.replace(temporary_path, self.path)
-            temporary_path = None
-        except OSError as exc:
-            raise ConfigError(
-                f"Could not save configuration {self.path}: {exc}"
-            ) from exc
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+        write_private_json(
+            self.path, config, manage_parent_permissions=self._manage_parent_permissions
+        )
 
     @staticmethod
     def _validate(config: Any) -> None:
