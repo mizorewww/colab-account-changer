@@ -197,9 +197,7 @@ def test_use_no_save_keeps_tracked_profiles_previous_copy(
     assert credentials.read_profile("personal") == make_token("personal")
 
 
-def test_using_current_profile_preserves_a_refreshed_active_token(
-    manager, credentials
-):
+def test_using_current_profile_preserves_a_refreshed_active_token(manager, credentials):
     manager.save("personal", verify=False)
     credentials.write_colab(make_token("personal-refreshed"))
 
@@ -244,9 +242,7 @@ def test_add_authenticates_in_an_empty_slot_and_keeps_new_account_active(
     assert manager.config.load()["active_profile"] == "work"
 
 
-def test_add_restores_original_account_when_authentication_fails(
-    manager, credentials
-):
+def test_add_restores_original_account_when_authentication_fails(manager, credentials):
     manager.save("personal", verify=False)
     manager.runner.return_value = subprocess.CompletedProcess(["colab"], 1)
 

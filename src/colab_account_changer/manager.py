@@ -127,9 +127,7 @@ class AccountManager:
         force: bool = False,
     ) -> Profile:
         with self._locked():
-            return self._save_unlocked(
-                name, email=email, verify=verify, force=force
-            )
+            return self._save_unlocked(name, email=email, verify=verify, force=force)
 
     def _save_unlocked(
         self,
@@ -212,9 +210,7 @@ class AccountManager:
             if original is not None and active == name:
                 # Avoid replacing a newly refreshed upstream token with an older copy.
                 if save_current:
-                    self._save_unlocked(
-                        name, email=None, verify=verify, force=False
-                    )
+                    self._save_unlocked(name, email=None, verify=verify, force=False)
                 return self._profile(
                     name, self.config.load()["profiles"][name], is_active=True
                 )
@@ -243,9 +239,7 @@ class AccountManager:
                         "it first with 'colab-account save NAME'."
                     )
                 if save_current:
-                    self._save_unlocked(
-                        active, email=None, verify=verify, force=False
-                    )
+                    self._save_unlocked(active, email=None, verify=verify, force=False)
                 elif self.credentials.read_profile(active) is None:
                     raise AccountError(
                         "The current profile has no saved credential. Save it "
@@ -301,9 +295,7 @@ class AccountManager:
                         "The current Colab credential is not tracked. Please save "
                         "it first with 'colab-account save NAME'."
                     )
-                self._save_unlocked(
-                    active, email=None, verify=verify, force=False
-                )
+                self._save_unlocked(active, email=None, verify=verify, force=False)
             legacy = self.legacy_token_path()
             if legacy.exists():
                 raise AccountError(
@@ -351,9 +343,7 @@ class AccountManager:
                 }
                 updated["active_profile"] = name
                 self.config.save(updated)
-                return self._profile(
-                    name, updated["profiles"][name], is_active=True
-                )
+                return self._profile(name, updated["profiles"][name], is_active=True)
             except BaseException as exc:
                 self._restore_colab(original, exc)
                 if created_profile:

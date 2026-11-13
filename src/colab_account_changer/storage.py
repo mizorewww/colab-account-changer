@@ -58,9 +58,7 @@ class ConfigStore:
         try:
             config = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ConfigError(
-                f"Invalid configuration at {self.path}: {exc}"
-            ) from exc
+            raise ConfigError(f"Invalid configuration at {self.path}: {exc}") from exc
         self._validate(config)
         return config
 
