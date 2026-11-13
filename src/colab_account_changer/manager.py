@@ -237,20 +237,20 @@ class AccountManager:
                 )
 
             if original is not None and not discard_unsaved:
-                if not save_current:
-                    raise AccountError(
-                        "Saving the current profile was disabled. Re-run without "
-                        "--no-save, or explicitly pass --discard-unsaved if the "
-                        "current credential is disposable."
-                    )
                 if active is None:
                     raise AccountError(
                         "The current Colab credential is not tracked. Please save "
                         "it first with 'colab-account save NAME'."
                     )
-                self._save_unlocked(
-                    active, email=None, verify=verify, force=False
-                )
+                if save_current:
+                    self._save_unlocked(
+                        active, email=None, verify=verify, force=False
+                    )
+                elif self.credentials.read_profile(active) is None:
+                    raise AccountError(
+                        "The current profile has no saved credential. Save it "
+                        "first, or explicitly pass --discard-unsaved."
+                    )
 
             # If inspection refreshed the target, persist that refreshed copy first.
             if inspected.token_json != target_raw:

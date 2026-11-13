@@ -180,6 +180,23 @@ def test_use_restores_current_token_when_config_update_fails(
     assert credentials.read_colab() == make_token("personal")
 
 
+def test_use_no_save_keeps_tracked_profiles_previous_copy(
+    manager, credentials, config_store
+):
+    manager.save("personal", verify=False)
+    credentials.write_colab(make_token("work"))
+    manager.save("work", verify=False)
+    credentials.write_colab(make_token("personal-unsaved-change"))
+    config = config_store.load()
+    config["active_profile"] = "personal"
+    config_store.save(config)
+
+    manager.use("work", save_current=False, verify=False)
+
+    assert credentials.read_colab() == make_token("work")
+    assert credentials.read_profile("personal") == make_token("personal")
+
+
 def test_using_current_profile_preserves_a_refreshed_active_token(
     manager, credentials
 ):
