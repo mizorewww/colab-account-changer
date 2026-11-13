@@ -17,6 +17,7 @@ from rich.text import Text
 from colab_account_changer import __version__
 from colab_account_changer.errors import AccountChangerError
 from colab_account_changer.manager import AccountManager, DiscoveryResult, Profile
+from colab_account_changer.pool_cli import pool_app
 
 console = Console()
 error_console = Console(stderr=True)
@@ -29,6 +30,8 @@ app = typer.Typer(
     pretty_exceptions_show_locals=False,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
+
+app.add_typer(pool_app, name="pool")
 
 NameArgument = Annotated[str, typer.Argument(help="Local profile alias, not an email.")]
 OfflineOption = Annotated[
@@ -388,9 +391,9 @@ def remove(
     console.print(f"[green]Removed profile[/green] [bold]{escape(profile.name)}[/bold]")
 
 
-def main() -> None:
+def _run(application: typer.Typer) -> None:
     try:
-        app()
+        application()
     except AccountChangerError as exc:
         error_console.print(
             Panel(
@@ -399,10 +402,19 @@ def main() -> None:
                 border_style="red",
             )
         )
-        raise SystemExit(1) from exc
+        raise SystemExit(getattr(exc, "exit_code", 1)) from exc
     except KeyboardInterrupt as exc:
         error_console.print("\n[yellow]Cancelled.[/yellow]")
         raise SystemExit(130) from exc
+
+
+def main() -> None:
+    _run(app)
+
+
+def pool_main() -> None:
+    """Entry point for ``colab-pool``, equivalent to ``colab-account pool``."""
+    _run(pool_app)
 
 
 if __name__ == "__main__":

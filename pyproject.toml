@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 colab-account = "colab_account_changer.cli:main"
+colab-pool = "colab_account_changer.cli:pool_main"
 
 [project.urls]
 Homepage = "https://github.com/mizorewww/colab-account-changer"
