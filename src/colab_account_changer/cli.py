@@ -44,8 +44,8 @@ def _show_profile(action: str, profile: Profile) -> None:
     details = Table.grid(padding=(0, 2))
     details.add_column(style="bold")
     details.add_column()
-    details.add_row("Alias", profile.name)
-    details.add_row("Email", profile.email or "Not verified (offline)")
+    details.add_row("Alias", Text(profile.name))
+    details.add_row("Email", Text(profile.email or "Not verified (offline)"))
     console.print(
         Panel(
             details,
@@ -138,8 +138,8 @@ def current() -> None:
     details = Table.grid(padding=(0, 2))
     details.add_column(style="bold")
     details.add_column()
-    details.add_row("Alias", status.active_profile)
-    details.add_row("Email", status.email or "Not verified")
+    details.add_row("Alias", Text(status.active_profile))
+    details.add_row("Email", Text(status.email or "Not verified"))
     details.add_row(
         "Saved copy",
         "current" if status.matches_saved else "changed; run save to update",
@@ -246,7 +246,7 @@ def main() -> None:
     except AccountChangerError as exc:
         error_console.print(
             Panel(
-                str(exc),
+                Text(str(exc)),
                 title="[red]Account operation failed[/red]",
                 border_style="red",
             )

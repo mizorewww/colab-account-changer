@@ -57,6 +57,16 @@ def test_save_and_list_accounts(cli_manager):
     assert "saved" in result.stdout
 
 
+def test_offline_email_labels_are_rendered_literally(cli_manager):
+    result = runner.invoke(
+        app,
+        ["save", "personal", "--email", "[red]not-an-email", "--offline"],
+    )
+
+    assert result.exit_code == 0
+    assert "[red]not-an-email" in result.stdout
+
+
 def test_current_shows_unsaved_credential(cli_manager):
     result = runner.invoke(app, ["current"])
 
