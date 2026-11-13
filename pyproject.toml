@@ -1,6 +1,6 @@
 [project]
 name = "colab-account-changer"
-version = "0.1.2"
+version = "0.2.0"
 description = "A secure multi-account switcher for Google Colab CLI"
 readme = "README.md"
 requires-python = ">=3.12"
