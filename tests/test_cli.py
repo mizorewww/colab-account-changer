@@ -6,14 +6,19 @@ from typer.testing import CliRunner
 
 from colab_account_changer import __version__
 from colab_account_changer.cli import app, main
-from colab_account_changer.errors import ConfigError
+from colab_account_changer.errors import AccountError, ConfigError
 from colab_account_changer.manager import Profile
+from colab_account_changer.tokens import Identity, InspectedToken
+from colab_account_changer.usage import Usage
 
 runner = CliRunner()
 
 
 @pytest.fixture
 def cli_manager(manager, mocker):
+    manager.gcloud_runner = mocker.Mock(
+        return_value=subprocess.CompletedProcess(["gcloud"], 0, stdout="[]")
+    )
     mocker.patch("colab_account_changer.cli.AccountManager", return_value=manager)
     return manager
 
@@ -30,7 +35,8 @@ def test_help_and_version():
     assert __version__ in result.stdout
 
 
-def test_empty_account_list(cli_manager):
+def test_empty_account_list(cli_manager, credentials):
+    credentials.delete_colab()
     result = runner.invoke(app, ["list"])
 
     assert result.exit_code == 0
@@ -57,6 +63,74 @@ def test_save_and_list_accounts(cli_manager):
     assert "saved" in result.stdout
 
 
+def test_list_auto_discovers_and_imports_existing_account(cli_manager, mocker):
+    mocker.patch(
+        "colab_account_changer.manager.inspect_token",
+        side_effect=lambda raw, verify: InspectedToken(
+            raw, Identity(email="person@example.com")
+        ),
+    )
+
+    result = runner.invoke(app, ["list"])
+
+    assert result.exit_code == 0
+    assert "person" in result.stdout
+    assert "person@example.com" in result.stdout
+    assert "keyring" in result.stdout
+    assert cli_manager.config.load()["active_profile"] == "person"
+
+
+def test_sync_offline_imports_without_calling_google(cli_manager, mocker):
+    get = mocker.patch("colab_account_changer.tokens.requests.get")
+
+    result = runner.invoke(app, ["sync", "--offline"])
+
+    assert result.exit_code == 0
+    assert "imported 1 new profile(s)" in result.stdout
+    assert "current" in result.stdout
+    get.assert_not_called()
+
+
+def test_usage_displays_live_compute_units(cli_manager, mocker):
+    cli_manager.save("personal", email="person@example.com", verify=False)
+    cli_manager.usage_service = mocker.Mock()
+    cli_manager.usage_service.fetch.return_value = Usage(298.53, 0.07, 2)
+
+    result = runner.invoke(app, ["usage", "personal"])
+
+    assert result.exit_code == 0
+    assert "298.53 compute units" in result.stdout
+    assert "0.07 CU/hr" in result.stdout
+    assert "2" in result.stdout
+    cli_manager.usage_service.fetch.assert_called_once_with(make_token("personal"))
+
+
+def test_list_usage_queries_each_profile_without_switching(
+    cli_manager, credentials, mocker
+):
+    cli_manager.save("personal", email="person@example.com", verify=False)
+    credentials.write_colab(make_token("work"))
+    cli_manager.save("work", email="work@example.com", verify=False)
+
+    def fetch(raw):
+        if raw == make_token("personal"):
+            return Usage(100.0, 0.25, 1)
+        raise AccountError("usage denied")
+
+    cli_manager.usage_service = mocker.Mock()
+    cli_manager.usage_service.fetch.side_effect = fetch
+
+    result = runner.invoke(app, ["list", "--usage"])
+
+    assert result.exit_code == 0
+    assert "100.00" in result.stdout
+    assert "0.25" in result.stdout
+    assert "error" in result.stdout
+    assert "usage denied" in result.stderr
+    assert credentials.read_keyring_colab() == make_token("work")
+    assert cli_manager.config.load()["active_profile"] == "work"
+
+
 def test_offline_email_labels_are_rendered_literally(cli_manager):
     result = runner.invoke(
         app,
@@ -67,12 +141,18 @@ def test_offline_email_labels_are_rendered_literally(cli_manager):
     assert "[red]not-an-email" in result.stdout
 
 
-def test_current_shows_unsaved_credential(cli_manager):
+def test_current_auto_discovers_existing_credential_without_network(
+    cli_manager, mocker
+):
+    get = mocker.patch("colab_account_changer.tokens.requests.get")
+
     result = runner.invoke(app, ["current"])
 
     assert result.exit_code == 0
-    assert "not tracked" in result.stdout
-    assert "save NAME" in result.stdout
+    assert "Current Colab account" in result.stdout
+    assert "current" in result.stdout
+    assert cli_manager.config.load()["active_profile"] == "current"
+    get.assert_not_called()
 
 
 def test_current_shows_active_account(cli_manager):

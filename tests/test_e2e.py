@@ -23,8 +23,11 @@ def isolated_cli(tmp_path):
             "HOME": str(tmp_path / "home"),
             "NO_COLOR": "1",
             "TERM": "dumb",
+            # Prevent discovery from consulting the host's real gcloud records.
+            "PATH": str(tmp_path / "bin"),
         }
     )
+    (tmp_path / "bin").mkdir()
     (tmp_path / "next-login.txt").write_text("personal")
     fake_colab = tmp_path / "fake-colab"
     fake_colab.write_text(
@@ -107,6 +110,36 @@ def test_complete_account_workflow_without_real_credentials(isolated_cli):
     assert "fake-access-" not in all_output
     assert "fake-refresh-" not in all_output
     assert "fake-client-secret" not in config_text
+
+
+def test_existing_legacy_record_is_auto_discovered_without_modification(isolated_cli):
+    invoke, tmp_path, _ = isolated_cli
+    legacy = tmp_path / "home/.config/colab-cli/token.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(
+        json.dumps(
+            {
+                "token": "fake-access-legacy",
+                "refresh_token": "fake-refresh-legacy",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "client_id": "fake-client-id",
+                "client_secret": "fake-client-secret",
+                "scopes": ["openid"],
+                "expiry": "2999-01-01T00:00:00Z",
+            }
+        )
+    )
+
+    synced = invoke("sync", "--offline")
+
+    assert synced.returncode == 0, synced.stderr
+    assert "imported 1 new profile(s)" in synced.stdout
+    assert "legacy" in synced.stdout
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["active_profile"] == "legacy"
+    assert config["profiles"]["legacy"]["source"] == "legacy"
+    assert "fake-refresh-legacy" not in (tmp_path / "config.json").read_text()
+    assert "fake-access-legacy" in legacy.read_text()
 
 
 def test_failed_new_login_restores_original_in_real_cli_process(isolated_cli):

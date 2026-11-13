@@ -15,7 +15,7 @@ from rich.text import Text
 
 from colab_account_changer import __version__
 from colab_account_changer.errors import AccountChangerError
-from colab_account_changer.manager import AccountManager, Profile
+from colab_account_changer.manager import AccountManager, DiscoveryResult, Profile
 
 console = Console()
 error_console = Console(stderr=True)
@@ -74,47 +74,182 @@ def root(
     """Manage local Colab CLI accounts without writing tokens to disk."""
 
 
-@app.command("list")
-def list_accounts() -> None:
-    """List saved profiles and their keyring status."""
-    profiles = AccountManager().profiles()
+def _discover(
+    manager: AccountManager, *, offline: bool, include_gcloud: bool
+) -> DiscoveryResult:
+    result = manager.discover(verify=not offline, include_gcloud=include_gcloud)
+    for message in result.errors:
+        error_console.print(
+            Panel(Text(message), title="Discovery warning", border_style="yellow")
+        )
+    return result
+
+
+def _render_accounts(
+    manager: AccountManager,
+    *,
+    gcloud_accounts: list[str] | None = None,
+    with_usage: bool = False,
+) -> None:
+    profiles = manager.profiles()
+    usage_values = {}
+    usage_errors = {}
+    if with_usage:
+        with console.status("Fetching account usage…", spinner="dots"):
+            for profile in profiles:
+                if not profile.stored:
+                    continue
+                try:
+                    usage_values[profile.name] = manager.usage(profile.name)
+                except AccountChangerError as exc:
+                    usage_errors[profile.name] = str(exc)
+
     if not profiles:
         console.print(
             Panel(
-                "No saved accounts yet.\n\n"
-                "Save the current login: [cyan]colab-account save NAME[/cyan]\n"
-                "Authenticate another: [cyan]colab-account add NAME[/cyan]",
+                "No saved accounts or discoverable OAuth credentials.\n\n"
+                "Authenticate an account: [cyan]colab-account add NAME[/cyan]",
                 title="Colab accounts",
                 border_style="cyan",
             )
         )
-        return
-    table = Table(title="Colab accounts", box=box.ROUNDED, header_style="bold cyan")
-    table.add_column("", width=2)
-    table.add_column("Alias", style="bold")
-    table.add_column("Email")
-    table.add_column("Credential")
-    table.add_column("Updated", style="dim")
-    for profile in profiles:
-        table.add_row(
-            Text("●", style="green") if profile.is_active else Text(""),
-            Text(profile.name),
-            Text(profile.email or "Not verified"),
-            Text("saved", style="green")
-            if profile.stored
-            else Text("missing", style="red"),
-            profile.updated_at.replace("T", " ")[:19],
+    else:
+        table = Table(title="Colab accounts", box=box.ROUNDED, header_style="bold cyan")
+        table.add_column("", width=2)
+        table.add_column("Alias", style="bold")
+        table.add_column("Email")
+        table.add_column("Source", style="dim")
+        table.add_column("Credential")
+        if with_usage:
+            table.add_column("Balance (CU)", justify="right")
+            table.add_column("CU/hr", justify="right")
+            table.add_column("VMs", justify="right")
+        table.add_column("Updated", style="dim")
+        for profile in profiles:
+            row = [
+                Text("●", style="green") if profile.is_active else Text(""),
+                Text(profile.name),
+                Text(profile.email or "Not verified"),
+                Text(profile.source),
+                Text("saved", style="green")
+                if profile.stored
+                else Text("missing", style="red"),
+            ]
+            if with_usage:
+                usage = usage_values.get(profile.name)
+                row.extend(
+                    [
+                        Text(f"{usage.balance:.2f}")
+                        if usage
+                        else Text("error" if profile.name in usage_errors else "—"),
+                        Text(f"{usage.hourly_rate:.2f}") if usage else Text("—"),
+                        Text(str(usage.assignments)) if usage else Text("—"),
+                    ]
+                )
+            row.append(Text(profile.updated_at.replace("T", " ")[:19]))
+            table.add_row(*row)
+        console.print(table)
+        console.print(
+            "[dim]● Active profile for the default Colab CLI OAuth provider.[/dim]"
         )
-    console.print(table)
-    console.print(
-        "[dim]● Active profile for the default Colab CLI OAuth provider.[/dim]"
+    for name, message in usage_errors.items():
+        error_console.print(
+            Panel(
+                Text(message), title=f"Usage unavailable: {name}", border_style="yellow"
+            )
+        )
+
+    linked_emails = {profile.email.casefold() for profile in profiles if profile.email}
+    gcloud_only = [
+        account
+        for account in gcloud_accounts or []
+        if account.casefold() not in linked_emails
+    ]
+    if gcloud_only:
+        console.print(
+            Panel(
+                Text("\n".join(gcloud_only)),
+                title="gcloud accounts without a Colab OAuth credential",
+                subtitle="Discovered, but not switchable or eligible for usage query",
+                border_style="yellow",
+            )
+        )
+
+
+@app.command("list")
+def list_accounts(
+    with_usage: Annotated[
+        bool,
+        typer.Option(
+            "--usage", help="Include live balance, hourly rate, and VM count."
+        ),
+    ] = False,
+    offline: OfflineOption = False,
+    no_discover: Annotated[
+        bool,
+        typer.Option("--no-discover", help="Only read existing changer profiles."),
+    ] = False,
+) -> None:
+    """Auto-discover and list Colab accounts, optionally with live usage."""
+    manager = AccountManager()
+    discovery = (
+        None
+        if no_discover
+        else _discover(manager, offline=offline, include_gcloud=True)
     )
+    _render_accounts(
+        manager,
+        gcloud_accounts=discovery.gcloud_accounts if discovery else [],
+        with_usage=with_usage,
+    )
+
+
+@app.command()
+def sync(offline: OfflineOption = False) -> None:
+    """Import existing keyring and legacy Colab OAuth credentials."""
+    manager = AccountManager()
+    result = _discover(manager, offline=offline, include_gcloud=True)
+    console.print(
+        f"[green]Discovered {len(result.profiles)} OAuth account(s); "
+        f"imported {len(result.imported)} new profile(s).[/green]"
+    )
+    _render_accounts(manager, gcloud_accounts=result.gcloud_accounts)
+
+
+@app.command()
+def usage(
+    name: Annotated[
+        str | None,
+        typer.Argument(help="Profile alias (defaults to the active account)."),
+    ] = None,
+) -> None:
+    """Show live compute-unit balance and rate without switching accounts."""
+    manager = AccountManager()
+    _discover(manager, offline=False, include_gcloud=False)
+    value = manager.usage(name)
+    config = manager.config.load()
+    profile_name = name or config["active_profile"]
+    email = (
+        config["profiles"].get(profile_name, {}).get("email") if profile_name else None
+    )
+    details = Table.grid(padding=(0, 2))
+    details.add_column(style="bold")
+    details.add_column()
+    details.add_row("Account", Text(profile_name or "current"))
+    if email:
+        details.add_row("Email", Text(email))
+    details.add_row("Current balance", f"{value.balance:.2f} compute units")
+    details.add_row("Usage rate", f"{value.hourly_rate:.2f} CU/hr")
+    details.add_row("Active assignments", str(value.assignments))
+    console.print(Panel(details, title="Colab usage", border_style="cyan"))
 
 
 @app.command()
 def current() -> None:
     """Show the current local profile without contacting Google."""
-    status = AccountManager().status()
+    manager = AccountManager()
+    _discover(manager, offline=True, include_gcloud=False)
+    status = manager.status()
     if not status.has_credential:
         console.print(
             Panel(
@@ -185,6 +320,7 @@ def add(
         )
     )
     manager = AccountManager(colab_command=colab_command)
+    _discover(manager, offline=offline, include_gcloud=False)
     profile = manager.add(name, verify=not offline)
     _show_profile("Added and activated", profile)
 
@@ -213,8 +349,11 @@ def use(
             "[yellow]Warning:[/yellow] the current credential may be replaced "
             "without being saved."
         )
+    manager = AccountManager()
     with console.status(f"Switching to {name}…", spinner="dots"):
-        profile = AccountManager().use(
+        if not discard_unsaved:
+            _discover(manager, offline=offline, include_gcloud=False)
+        profile = manager.use(
             name,
             save_current=not no_save,
             discard_unsaved=discard_unsaved,
