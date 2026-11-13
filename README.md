@@ -21,10 +21,17 @@
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
-- 新版 `google-colab-cli`：支持钥匙串 OAuth 凭据和 `colab whoami`
+- `google-colab-cli>=0.8.0`：支持钥匙串 OAuth 凭据和 `colab whoami`
 - 可用的系统钥匙串（macOS Keychain、Windows Credential Locker 或 Linux Secret Service）
 
 旧版 `~/.config/colab-cli/token.json` 只读且不会被此工具删除或覆盖。没有钥匙串令牌时，它会成为当前账号的回退凭据。添加新账号时，Colab 子进程使用隔离的临时 `HOME`，防止旧文件被意外迁移。
+
+`add` 要求 Colab CLI 0.8.0 或更高版本；0.7.x 只写普通 token 文件，不受支持。可先升级：
+
+```bash
+uv tool upgrade google-colab-cli
+colab version
+```
 
 ## 安装
 
@@ -80,7 +87,9 @@ colab-account usage
 colab-account usage personal
 ```
 
-`sync --offline` / `list --offline` 可跳过新账号的在线身份验证。此时使用 `current` / `legacy` 等本地别名，邮箱显示为未验证；usage 查询本身仍需要网络。`list --no-discover` 只显示已导入的 profile。
+`sync --offline` / `list --offline` 可跳过新账号的在线身份验证。此时使用 `current` / `legacy` 等本地别名，邮箱显示为未验证；后续在线 `list` 会补全邮箱。usage 查询本身仍需要网络。`list --no-discover` 只显示已导入的 profile。
+
+离线发现只在 refresh token 相同时才把变化的当前凭据视为同账号刷新。如果 refresh token 不同，会新建未验证 profile，绝不覆盖旧账号。`save --offline` 遇到不同 refresh token 也会停止，要求先在线验证或显式使用 `--force`。
 
 `gcloud auth list` 中的账号也会被读取。只有 gcloud 名称而没有 Colab OAuth 凭据的账号会单独标注为“不可切换、不可查询 Colab usage”，不会与有效 Colab 账号混淆。
 
@@ -174,13 +183,17 @@ colab-account remove work --yes
 | 非敏感元数据 | `~/.config/colab-account-changer/config.json` |
 | 并发锁 | 同目录的 `config.lock` |
 
-配置目录权限为 `0700`，配置文件权限为 `0600`（POSIX）。可以通过环境变量隔离配置和锁：
+默认配置目录权限为 `0700`，配置文件权限为 `0600`（POSIX）。新建目录会设为 `0700`，但不会修改自定义配置路径已有父目录的权限。配置在临时文件权限设置完成后原子替换，替换成功后不再执行可能造成“已提交却报错”的操作。
+
+钥匙串读取有超时保护；写入和删除会同步等待后端完成，避免超时线程在回滚后延迟写入。若系统钥匙串被锁定，需要先解锁。
+
+可以通过环境变量隔离配置和锁：
 
 ```bash
 export COLAB_ACCOUNT_CHANGER_CONFIG=/path/to/config.json
 ```
 
-usage 使用 OAuth 凭据直接发送只读请求，不经过账号切换，也不创建运行时。网络错误不会直接展示可能包含令牌的请求 URL 或响应内容。
+usage 使用指定 profile 的 OAuth 凭据直接发送只读请求，不经过账号切换，也不创建运行时。profile 凭据缺失时会明确报错，不会回退到可能属于其他账号的当前令牌。网络错误不会直接展示可能包含令牌的请求 URL 或响应内容。
 
 ## 开发
 
