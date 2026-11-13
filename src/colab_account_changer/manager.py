@@ -22,6 +22,7 @@ from colab_account_changer.storage import (
     validate_profile_name,
 )
 from colab_account_changer.tokens import inspect_token, token_fingerprint
+from colab_account_changer.usage import Usage, UsageService
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class AccountManager:
         credentials: CredentialStore | None = None,
         runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
         gcloud_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+        usage_service: UsageService | None = None,
         colab_command: str = "colab",
         legacy_token_path: Callable[[], Path] | None = None,
     ) -> None:
@@ -68,6 +70,7 @@ class AccountManager:
         self.credentials = credentials or CredentialStore()
         self.runner = runner or subprocess.run
         self.gcloud_runner = gcloud_runner or subprocess.run
+        self.usage_service = usage_service or UsageService()
         self.colab_command = colab_command
         self.legacy_token_path = legacy_token_path or (
             lambda: Path.home() / ".config" / "colab-cli" / "token.json"
@@ -304,6 +307,25 @@ class AccountManager:
             return CurrentStatus(None, None, True, False)
         saved = self.credentials.read_profile(active)
         return CurrentStatus(active, email, True, saved == raw)
+
+    def usage(self, name: str | None = None) -> Usage:
+        """Fetch one account's usage without modifying the active credential."""
+        config = self.config.load()
+        name = name or config["active_profile"]
+        if name is None:
+            raw = self.credentials.read_colab()
+            if raw is None:
+                raise AccountError("No active Colab OAuth credential was found.")
+            return self.usage_service.fetch(raw)
+        name = self._name(name)
+        if name not in config["profiles"]:
+            raise AccountError(f"Profile {name!r} does not exist.")
+        raw = self.credentials.read_profile(name)
+        if raw is None and config["active_profile"] == name:
+            raw = self.credentials.read_colab()
+        if raw is None:
+            raise AccountError(f"Profile {name!r} has no saved credential.")
+        return self.usage_service.fetch(raw)
 
     def save(
         self,
