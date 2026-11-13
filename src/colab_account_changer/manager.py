@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 import subprocess
+import tempfile
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -506,21 +508,28 @@ class AccountManager:
                     )
                 self._save_unlocked(active, email=None, verify=verify, force=False)
             legacy = self.legacy_token_path()
-            if legacy.exists():
-                raise AccountError(
-                    f"A legacy token exists at {legacy}. Migrate it with the "
-                    "installed google-colab-cli version before adding an account; "
-                    "the file was left untouched."
-                )
 
             created_profile = False
             try:
                 self.credentials.delete_colab()
                 try:
-                    result = self.runner(
-                        [self.colab_command, "--auth=oauth2", "whoami"],
-                        check=False,
-                    )
+                    with tempfile.TemporaryDirectory(
+                        prefix="colab-account-auth-"
+                    ) as isolated_home:
+                        runner_options: dict[str, Any] = {}
+                        if legacy.exists():
+                            # Upstream migrates ~/.config/colab-cli/token.json when
+                            # its keyring is empty. Hide that file during new login
+                            # without moving, modifying, or deleting the original.
+                            environment = os.environ.copy()
+                            environment["HOME"] = isolated_home
+                            environment["USERPROFILE"] = isolated_home
+                            runner_options["env"] = environment
+                        result = self.runner(
+                            [self.colab_command, "--auth=oauth2", "whoami"],
+                            check=False,
+                            **runner_options,
+                        )
                 except FileNotFoundError as exc:
                     raise AccountError(
                         f"Colab CLI executable {self.colab_command!r} was not found."
@@ -530,7 +539,7 @@ class AccountManager:
                         f"Colab authentication failed with exit code "
                         f"{result.returncode}; the previous account was restored."
                     )
-                raw = self.credentials.read_colab()
+                raw = self.credentials.read_keyring_colab()
                 if raw is None:
                     raise AccountError(
                         "Colab authentication did not create an OAuth credential."

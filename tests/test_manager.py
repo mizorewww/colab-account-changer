@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 
 import pytest
 from conftest import make_token
@@ -308,19 +309,50 @@ def test_add_without_original_cleans_up_failed_new_login(manager, credentials):
     assert credentials.read_colab() is None
 
 
-def test_add_checks_for_legacy_token_before_clearing_current(
+def test_add_isolates_legacy_token_from_new_colab_authentication(
     manager, credentials, tmp_path
 ):
     manager.save("personal", verify=False)
     legacy = tmp_path / "legacy.json"
-    legacy.write_text("secret")
+    legacy.write_text(make_token("legacy"))
     manager.legacy_token_path = lambda: legacy
+    credentials.legacy_path = legacy
+    isolated_homes = []
 
-    with pytest.raises(AccountError, match="legacy token"):
+    def authenticate(command, check, env):
+        isolated_home = Path(env["HOME"])
+        isolated_homes.append(isolated_home)
+        assert isolated_home != Path.home()
+        assert env["USERPROFILE"] == str(isolated_home)
+        assert not (isolated_home / ".config/colab-cli/token.json").exists()
+        assert credentials.read_keyring_colab() is None
+        credentials.write_colab(make_token("work"))
+        return subprocess.CompletedProcess(command, 0)
+
+    manager.runner.side_effect = authenticate
+    manager.add("work", verify=False)
+
+    assert credentials.read_keyring_colab() == make_token("work")
+    assert legacy.read_text() == make_token("legacy")
+    assert not isolated_homes[0].exists()
+
+
+def test_add_does_not_mistake_legacy_file_for_successful_new_login(
+    manager, credentials, tmp_path
+):
+    manager.save("personal", verify=False)
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(make_token("legacy"))
+    manager.legacy_token_path = lambda: legacy
+    credentials.legacy_path = legacy
+    manager.runner.return_value = subprocess.CompletedProcess(["colab"], 0)
+
+    with pytest.raises(AccountError, match="did not create"):
         manager.add("work", verify=False)
-    manager.runner.assert_not_called()
-    assert credentials.read_colab() == make_token("personal")
-    assert legacy.read_text() == "secret"
+
+    assert credentials.read_keyring_colab() == make_token("personal")
+    assert credentials.read_profile("work") is None
+    assert legacy.read_text() == make_token("legacy")
 
 
 def test_profiles_report_active_and_missing_credentials(manager, credentials):
