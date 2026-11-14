@@ -185,6 +185,7 @@ class Snapshot:
     sessions: list[PoolSession]
     accounts: list[AccountState]
     errors: dict[str, str] = field(default_factory=dict)
+    usage_refreshed: bool = False
 
 
 @dataclass(frozen=True)
@@ -923,16 +924,33 @@ class ColabPool:
             sessions=sessions,
             accounts=accounts,
             errors=errors,
+            usage_refreshed=refresh,
         )
+
+
+def snapshot_usages(snapshot: Snapshot) -> list[Usage | None]:
+    """Return per-account values eligible for the aggregate total.
+
+    Live snapshots exclude stale values from failed refreshes and profiles whose
+    saved credential is missing. Cached snapshots intentionally use every cache.
+    """
+    return [
+        account.usage
+        if not snapshot.usage_refreshed
+        or (account.stored and account.name not in snapshot.errors)
+        else None
+        for account in snapshot.accounts
+    ]
 
 
 def snapshot_json(
     snapshot: Snapshot, server_report: ReconcileReport | None = None
 ) -> dict[str, Any]:
-    usages = [account.usage for account in snapshot.accounts]
+    usages = snapshot_usages(snapshot)
     total = total_usage(usages)
     result = {
         "primary": snapshot.primary,
+        "usage_mode": "live" if snapshot.usage_refreshed else "cached",
         "threshold": snapshot.threshold,
         "active": snapshot.active,
         "sessions": [asdict(session) for session in snapshot.sessions],
@@ -947,12 +965,15 @@ def snapshot_json(
                 ),
                 "assignments": account.usage.assignments if account.usage else None,
                 "usage_fetched_at": account.usage_fetched_at,
+                "usage_in_total": included_usage is not None,
                 "stored": account.stored,
                 "pool_sessions": account.sessions,
                 "primary": account.is_primary,
                 "active": account.is_active,
             }
-            for account in snapshot.accounts
+            for account, included_usage in zip(
+                snapshot.accounts, usages, strict=True
+            )
         ],
         "total": {
             "balance": total.balance if total else None,

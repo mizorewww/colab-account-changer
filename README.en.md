@@ -31,7 +31,7 @@ colab-account usage
 colab-account usage work
 ```
 
-**Total** sums known balances and consumption rates across accounts. If any usage is unavailable, **Known total** is shown instead of treating unknown balances as zero. **ETA** is the linear estimate `balance ÷ current CU/hr`; a positive balance with a zero rate shows `∞`. The estimate changes with assignments and usage and is not a guaranteed depletion time.
+**Total** sums the balances and consumption rates eligible for aggregation; incomplete coverage is labeled **Known total** instead of treating unknown balances as zero. A live refresh includes only accounts that succeeded and have a saved credential. Old values for failed accounts are marked `stale` / `no credential` and excluded, while `--cached` explicitly aggregates local caches. JSON exposes the same policy through `usage_mode` and per-account `usage_in_total`. **ETA** is the linear estimate `balance ÷ current CU/hr`; a positive balance with a zero rate shows `∞`. The estimate changes with assignments and usage and is not a guaranteed depletion time.
 
 ### 2. Add and switch accounts
 

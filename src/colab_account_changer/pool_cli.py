@@ -19,6 +19,7 @@ from colab_account_changer.pool import (
     SESSION_COMMANDS,
     ColabPool,
     snapshot_json,
+    snapshot_usages,
 )
 from colab_account_changer.usage import format_eta, total_usage
 
@@ -237,8 +238,17 @@ def list_pool(
     accounts.add_column("ETA h", justify="right")
     accounts.add_column("VMs", justify="right")
     accounts.add_column("Pooled", justify="right")
+    accounts.add_column("Usage", style="dim")
     for account in snapshot.accounts:
         usage = account.usage
+        if not snapshot.usage_refreshed:
+            usage_state = "cached" if usage else "—"
+        elif not account.stored:
+            usage_state = "no credential"
+        elif account.name in snapshot.errors:
+            usage_state = "stale" if usage else "error"
+        else:
+            usage_state = "live" if usage else "—"
         marker = Text("★", style="yellow") if account.is_primary else Text("")
         if account.is_active:
             marker.append("●", style="green")
@@ -253,9 +263,10 @@ def list_pool(
             Text(format_eta(usage)),
             Text(str(usage.assignments)) if usage else Text("—"),
             Text(str(account.sessions)),
+            Text(usage_state),
         )
     console.print(accounts)
-    usages = [account.usage for account in snapshot.accounts]
+    usages = snapshot_usages(snapshot)
     total = total_usage(usages)
     if total is None:
         console.print("[dim]Total CU: — (no usage data)[/dim]")

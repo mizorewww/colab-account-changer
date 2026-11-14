@@ -15,7 +15,8 @@ import pytest
 from conftest import make_token
 from filelock import FileLock
 
-from colab_account_changer.pool import ColabPool, hardware_from_args
+from colab_account_changer.errors import AccountError
+from colab_account_changer.pool import ColabPool, hardware_from_args, snapshot_json
 from colab_account_changer.tokens import token_fingerprint
 from colab_account_changer.usage import Usage
 
@@ -561,6 +562,7 @@ def test_list_json_and_table(env):
     assert result.returncode == 0, result.stderr
     snapshot = json.loads(result.stdout)
     assert snapshot["primary"] == "beta"
+    assert snapshot["usage_mode"] == "cached"
     assert snapshot["active"] == "beta"
     assert snapshot["threshold"] == 5.0
     assert snapshot["sessions"][0]["endpoint"] == "ep-node-a-alpha"
@@ -599,6 +601,7 @@ def test_list_json_and_table(env):
     assert table.returncode == 0
     assert "node-a" in table.stdout
     assert "pooled" in table.stdout
+    assert "cached" in table.stdout
     assert "2/2 accounts inspected" in table.stdout
     assert "100.00" in table.stdout
     assert "Total:" in table.stdout
@@ -700,6 +703,73 @@ def test_hardware_label_from_new_arguments():
     assert hardware_from_args(["--gpu", "G4"]) == "g4"
     assert hardware_from_args(["--tpu=v5e1"]) == "v5e1"
     assert hardware_from_args(["--high-mem"]) == "cpu"
+
+
+@pytest.mark.parametrize("missing_credential", [False, True])
+def test_live_total_excludes_stale_and_uncredentialed_usage(
+    manager, credentials, mocker, missing_credential
+):
+    now = "2026-01-01T00:00:00+00:00"
+    balances = {"alpha": 50.0, "beta": 100.0}
+    for name in balances:
+        token = make_token(name)
+        credentials.write_profile(name, token)
+    config = {
+        "version": 1,
+        "active_profile": "alpha",
+        "profiles": {
+            name: {
+                "email": f"{name}@example.com",
+                "created_at": now,
+                "updated_at": now,
+                "token_sha256": token_fingerprint(make_token(name)),
+                "usage": {
+                    "balance": balance,
+                    "hourly_rate": 1.5,
+                    "assignments": 0,
+                    "fetched_at": now,
+                },
+            }
+            for name, balance in balances.items()
+        },
+    }
+    manager.config.save(config)
+    if missing_credential:
+        credentials.delete_profile("beta")
+
+    def fetch(raw):
+        if raw == make_token("alpha"):
+            return Usage(49.0, 1.0, 1)
+        raise AccountError("usage denied")
+
+    manager.usage_service = mocker.Mock()
+    manager.usage_service.fetch.side_effect = fetch
+    pool = ColabPool(manager, verify=False)
+
+    snapshot = pool.snapshot(refresh=True)
+    payload = snapshot_json(snapshot)
+
+    assert snapshot.errors == ({} if missing_credential else {"beta": "usage denied"})
+    assert payload["usage_mode"] == "live"
+    assert payload["total"] == {
+        "balance": 49.0,
+        "hourly_rate": 1.0,
+        "hours_remaining": 49.0,
+        "assignments": 1,
+        "accounts_with_usage": 1,
+        "account_count": 2,
+        "complete": False,
+    }
+    accounts = {account["name"]: account for account in payload["accounts"]}
+    assert accounts["alpha"]["usage_in_total"] is True
+    assert accounts["beta"]["balance"] == 100.0  # Last-known-good remains visible.
+    assert accounts["beta"]["usage_in_total"] is False
+    assert manager.usage_service.fetch.call_count == (1 if missing_credential else 2)
+
+    cached = snapshot_json(pool.snapshot(refresh=False))
+    assert cached["usage_mode"] == "cached"
+    assert cached["total"]["balance"] == 149.0
+    assert cached["total"]["complete"] is True
 
 
 def test_new_refreshes_usage_before_choosing(manager, credentials, mocker):
