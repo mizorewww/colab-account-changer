@@ -151,12 +151,18 @@ def _usage_cell(value: float | None) -> Text:
 def list_pool(
     ctx: typer.Context, cached: CachedOption = False, as_json: JsonOption = False
 ):
-    """Show pooled sessions, account balances, and the primary account."""
+    """Show account balances and live server instances across all accounts."""
     pool = _pool(ctx)
     if as_json:
-        _print_json(snapshot_json(pool.snapshot(refresh=not cached)))
+        with pool.hold():
+            server_report = pool.reconcile(all_accounts=True, refresh=False)
+            snapshot = pool.snapshot(refresh=not cached)
+        _print_json(snapshot_json(snapshot, server_report))
+        if server_report.errors:
+            raise typer.Exit(1)
         return
-    with console.status("Fetching account usage…", spinner="dots"):
+    with console.status("Loading pool overview…", spinner="dots"), pool.hold():
+        server_report = pool.reconcile(all_accounts=True, refresh=False)
         snapshot = pool.snapshot(refresh=not cached)
     accounts = Table(title="Pool accounts", box=box.ROUNDED, header_style="bold cyan")
     accounts.add_column("", width=2)
@@ -204,30 +210,50 @@ def list_pool(
         f"[dim]★ Primary ({escape(snapshot.primary or 'unset')}; switch below "
         f"{snapshot.threshold:g} CU)  ● Active Colab account[/dim]"
     )
-    sessions = Table(title="Pooled sessions", box=box.ROUNDED, header_style="bold cyan")
-    sessions.add_column("Name", style="bold", overflow="fold")
+    inspected = len(server_report.accounts) - len(server_report.errors)
+    sessions = Table(
+        title=(
+            f"Colab server instances ({inspected}/{len(server_report.accounts)} "
+            "accounts inspected)"
+        ),
+        box=box.ROUNDED,
+        header_style="bold cyan",
+    )
+    sessions.add_column("Local name", style="bold", overflow="fold")
     sessions.add_column("Account", overflow="fold")
     sessions.add_column("Hardware")
     sessions.add_column("Endpoint", overflow="fold")
-    sessions.add_column("Created", style="dim")
-    for session in snapshot.sessions:
+    sessions.add_column("State")
+    sessions.add_column("Registered (local)", style="dim")
+    pooled = {session.name: session for session in snapshot.sessions}
+    for entry in server_report.server:
+        session = pooled.get(entry.session) if entry.session else None
+        sessions.add_row(
+            Text(entry.session or "—"),
+            Text(entry.account),
+            Text(entry.hardware),
+            Text(entry.endpoint),
+            Text("pooled", style="green")
+            if entry.session
+            else Text("orphan", style="red"),
+            Text(session.created_at if session else "—"),
+        )
+    for session in server_report.vanished:
         sessions.add_row(
             Text(session.name),
             Text(session.account),
             Text(session.hardware),
-            Text(
-                session.endpoint or "missing record",
-                style="" if session.endpoint else "yellow",
-            ),
+            Text(session.endpoint or "missing record", style="yellow"),
+            Text("vanished", style="yellow"),
             Text(session.created_at),
         )
-    if snapshot.sessions:
+    if server_report.server or server_report.vanished:
         console.print(sessions)
     else:
         console.print(
             Panel(
-                "No pooled sessions. Create one with [cyan]pool new NAME[/cyan].",
-                title="Pooled sessions",
+                "No server instances in successfully inspected accounts.",
+                title="Colab server instances",
                 border_style="cyan",
             )
         )
@@ -237,6 +263,14 @@ def list_pool(
                 Text(message), title=f"Usage unavailable: {name}", border_style="yellow"
             )
         )
+    for name, message in server_report.errors.items():
+        error_console.print(
+            Panel(
+                Text(message), title=f"Could not inspect {name}", border_style="red"
+            )
+        )
+    if server_report.errors:
+        raise typer.Exit(1)
 
 
 @pool_app.command()

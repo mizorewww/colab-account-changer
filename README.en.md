@@ -67,8 +67,11 @@ colab-pool new node-y --account work
 colab-pool exec node-x -f train.py
 colab-pool upload node-x data.tgz /content/data.tgz
 
-# Show sessions, usage per account, and the primary account
+# Show live server instances across all saved accounts, usage, and the primary
 colab-pool list
+
+# Skip only the usage refresh; server instances are still queried live
+colab-pool list --cached
 
 # Stop and deregister a session
 colab-pool stop node-x
@@ -76,6 +79,8 @@ colab-pool stop node-x
 # Check for unregistered or vanished sessions
 colab-pool reconcile
 ```
+
+The `list` instance table shows `pooled` (matched to a local registration), `orphan` (present on the server but unregistered), and `vanished` (a local registration no longer present on the server). Names and registration times are local; endpoints and online hardware come from server queries. The table title reports account coverage, and the command exits nonzero if any account cannot be inspected so a failed query is not mistaken for zero instances. JSON output exposes the same coverage and errors under `server_inspection`.
 
 The pool keeps using its primary account and switches to the account with the highest balance when the primary drops below 5 CU. Set the primary account and threshold manually with:
 

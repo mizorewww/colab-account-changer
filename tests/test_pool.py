@@ -495,8 +495,25 @@ def test_list_json_and_table(env):
     assert result.returncode == 0, result.stderr
     snapshot = json.loads(result.stdout)
     assert snapshot["primary"] == "beta"
+    assert snapshot["active"] == "beta"
     assert snapshot["threshold"] == 5.0
     assert snapshot["sessions"][0]["endpoint"] == "ep-node-a-alpha"
+    assert snapshot["server"] == [
+        {
+            "account": "alpha",
+            "endpoint": "ep-node-a-alpha",
+            "hardware": "t4",
+            "session": "node-a",
+        }
+    ]
+    assert snapshot["orphans"] == []
+    assert snapshot["vanished"] == []
+    assert snapshot["server_inspection"] == {
+        "accounts": ["alpha", "beta"],
+        "accounts_succeeded": 2,
+        "complete": True,
+        "errors": {},
+    }
     accounts = {account["name"]: account for account in snapshot["accounts"]}
     assert accounts["alpha"]["pool_sessions"] == 1
     assert accounts["beta"]["balance"] == 100.0
@@ -515,6 +532,8 @@ def test_list_json_and_table(env):
     table = env.pool("list", "--cached")
     assert table.returncode == 0
     assert "node-a" in table.stdout
+    assert "pooled" in table.stdout
+    assert "2/2 accounts inspected" in table.stdout
     assert "100.00" in table.stdout
     assert "Total:" in table.stdout
     assert "150.00" in table.stdout
@@ -531,6 +550,47 @@ def test_list_json_and_table(env):
     )
     assert via_main.returncode == 0
     assert "beta" in via_main.stdout
+
+
+def test_list_shows_orphans_and_vanished_across_all_accounts(env):
+    created(env, "node-a", "alpha")
+    server = env.server_state()
+    del server["alpha"]["ep-node-a-alpha"]
+    server.setdefault("beta", {})["ep-orphan"] = "T4"
+    env.server.write_text(json.dumps(server))
+
+    result = env.pool("list", "--cached", "--json")
+
+    assert result.returncode == 0, result.stderr
+    snapshot = json.loads(result.stdout)
+    assert snapshot["server"][0]["account"] == "beta"
+    assert snapshot["server"][0]["session"] is None
+    assert snapshot["orphans"][0]["endpoint"] == "ep-orphan"
+    assert [entry["name"] for entry in snapshot["vanished"]] == ["node-a"]
+    # Listing uses throw-away probes and does not prune real local records.
+    assert "node-a" in env.records("alpha")
+
+    table = env.pool("list", "--cached")
+    assert table.returncode == 0
+    assert "orphan" in table.stdout
+    assert "vanished" in table.stdout
+
+
+def test_list_reports_partial_server_inspection_failure(env):
+    result = env.pool(
+        "list",
+        "--cached",
+        "--json",
+        extra_env={"FAKE_COLAB_SESSIONS_FAIL": "1"},
+    )
+
+    assert result.returncode == 1
+    snapshot = json.loads(result.stdout)
+    assert snapshot["total"]["balance"] == 150.0
+    assert snapshot["server"] == []
+    assert snapshot["server_inspection"]["accounts_succeeded"] == 0
+    assert snapshot["server_inspection"]["complete"] is False
+    assert set(snapshot["server_inspection"]["errors"]) == {"alpha", "beta"}
 
 
 def test_concurrent_commands_are_serialized_on_the_right_account(env):

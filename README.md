@@ -67,8 +67,11 @@ colab-pool new node-y --account work
 colab-pool exec node-x -f train.py
 colab-pool upload node-x data.tgz /content/data.tgz
 
-# 查看会话、各账号用量和主账号
+# 查看所有已保存账号的服务端实例、各账号用量和主账号
 colab-pool list
+
+# 仅跳过用量刷新；实例清单仍逐账号实时查询
+colab-pool list --cached
 
 # 停止并注销会话
 colab-pool stop node-x
@@ -76,6 +79,8 @@ colab-pool stop node-x
 # 检查未登记或已消失的会话
 colab-pool reconcile
 ```
+
+`list` 的实例表包含 `pooled`（与本地登记匹配）、`orphan`（服务端存在但未登记）和 `vanished`（本地登记已不在服务端）。名称和登记时间来自本地；endpoint 和在线硬件来自服务端查询。表头显示成功检查的账号数，任一账号检查失败时命令返回非零，避免把查询失败误认为零实例。`--json` 输出中的 `server_inspection` 提供同样的覆盖率和错误信息。
 
 资源池默认持续使用主账号，主账号余额低于 5 CU 时切换到余额最高的账号。可手动设置主账号和切换阈值：
 

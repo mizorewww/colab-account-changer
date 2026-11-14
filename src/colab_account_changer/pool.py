@@ -861,10 +861,12 @@ class ColabPool:
         )
 
 
-def snapshot_json(snapshot: Snapshot) -> dict[str, Any]:
+def snapshot_json(
+    snapshot: Snapshot, server_report: ReconcileReport | None = None
+) -> dict[str, Any]:
     usages = [account.usage for account in snapshot.accounts]
     total = total_usage(usages)
-    return {
+    result = {
         "primary": snapshot.primary,
         "threshold": snapshot.threshold,
         "active": snapshot.active,
@@ -898,3 +900,15 @@ def snapshot_json(snapshot: Snapshot) -> dict[str, Any]:
         },
         "errors": snapshot.errors,
     }
+    if server_report is not None:
+        result["server"] = [asdict(entry) for entry in server_report.server]
+        result["orphans"] = [asdict(entry) for entry in server_report.orphans]
+        result["vanished"] = [asdict(session) for session in server_report.vanished]
+        result["server_inspection"] = {
+            "accounts": server_report.accounts,
+            "accounts_succeeded": len(server_report.accounts)
+            - len(server_report.errors),
+            "complete": not server_report.errors,
+            "errors": server_report.errors,
+        }
+    return result
