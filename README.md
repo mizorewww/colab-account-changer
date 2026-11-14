@@ -84,6 +84,9 @@ colab-pool stop-all --yes
 
 # 检查未登记或已消失的会话
 colab-pool reconcile
+
+# 列出既未登记、也不在服务端的残留 Colab 记录；加 --yes 才删除
+colab-pool prune-state
 ```
 
 `stop-all` 会逐个账号处理，单个实例失败不会阻止其他实例；最多进行三轮以处理失败或新发现的实例。只有服务端无实例、无账号查询错误且本地池登记清空时才报告成功，否则列出剩余 endpoint/账号并返回非零。后台启动器仍可能继续创建新实例，本命令不会杀死本地进程。
@@ -102,7 +105,9 @@ colab-pool primary work --threshold 3
 - 按名称执行时直接传 Colab 参数，例如 `colab-pool exec node-x -f train.py`；`exec` 的名称后不要额外插入 `--`。
 - `404/401 ... Cleaning up` 表示 Colab CLI 无法连接运行时并删除了本地记录。命令失败后，资源池会复查所属账号的服务端；确认 endpoint 已消失时自动注销旧登记，然后可用原名称重新 `new`。
 - 如果服务端核对失败或 endpoint 仍存在，资源池会保留登记，避免留下无法管理的 VM。先运行 `colab-pool reconcile --all` 检查，不要盲目重复执行或重建。
-- 对已确认消失但仍保留的旧登记，运行 `colab-pool stop NAME` 清理。不要混用原始 `colab` 与 `colab-pool` 操作同一个会话；原始命令不持有资源池的账号锁。
+- 对已确认消失但仍保留的旧登记，运行 `colab-pool stop NAME` 清理；即使 `colab stop` 失败，只要服务端确认 endpoint 已不存在，也会注销登记。
+- 注销已确认消失的会话（自动清理、`stop`、`stop-all`）时，资源池同时删除该账号 state 文件中的同名 Colab 记录，名称可直接复用。`stop --forget` 不联系 Colab，会保留记录；之后 `new` 同名时先向服务端核实：已消失则清掉旧记录后创建，仍存在则拒绝并提示 `adopt`/`reap`，无法核实则拒绝。`colab-pool prune-state` 报告所有账号中这类残留记录，`--yes` 才删除，仍在服务端的记录永不删除。
+- 不要混用原始 `colab` 与 `colab-pool` 操作同一个会话；原始命令不持有资源池的账号锁。
 
 ## 注意
 

@@ -152,6 +152,11 @@ def env(tmp_path):
     assert "Traceback" not in combined
 
 
+def flat(text):
+    """Undo Rich panel wrapping so long messages can be matched."""
+    return " ".join(text.replace("\u2502", " ").split())
+
+
 def created(env, name, account, *extra):
     result = env.pool("new", name, "--cached", "--account", account, *extra)
     assert result.returncode == 0, result.stderr
@@ -332,10 +337,10 @@ def test_masked_auth_failure_does_not_deregister_pruned_session(env):
     )
 
     assert result.returncode == 1
-    assert "server state could not be verified" in result.stderr
-    assert "1 active assignment(s)" in result.stderr
-    assert "Keeping the pool registration" in result.stderr
-    assert "vanished" not in result.stderr
+    assert "server state could not be verified" in flat(result.stderr)
+    assert "1 active assignment(s)" in flat(result.stderr)
+    assert "Keeping the pool registration" in flat(result.stderr)
+    assert "vanished" not in flat(result.stderr)
     assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
     assert "ep-node-a-alpha" in env.server_state()["alpha"]
 
@@ -360,7 +365,7 @@ def test_reconcile_reports_untrustworthy_empty_listing(env, extra_env, message):
     report = json.loads(result.stdout)
     assert report["consistent"] is False
     assert "alpha" in report["errors"]
-    assert message in report["errors"]["alpha"]
+    assert message in flat(report["errors"]["alpha"])
     assert [entry["name"] for entry in report["vanished"]] == []
     assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
 
@@ -385,8 +390,8 @@ def test_stop_all_does_not_trust_masked_auth_failure(env):
     result = env.pool("stop-all", "--yes", extra_env={"FAKE_COLAB_AUTH_FAIL": "alpha"})
 
     assert result.returncode == 1
-    assert "Could not inspect alpha" in result.stderr
-    assert "Stop-all incomplete:" in result.stderr
+    assert "Could not inspect alpha" in flat(result.stderr)
+    assert "Stop-all incomplete:" in flat(result.stderr)
     assert "Verified: no server instances" not in result.stdout
     assert env.server_state()["alpha"] == {"ep-orphan": "T4"}
     assert env.server_state()["beta"] == {}
@@ -405,14 +410,104 @@ def test_stop_deregisters_even_when_server_lost_the_session(env):
     server["beta"] = {}
     env.server.write_text(json.dumps(server))
     gone = env.pool("stop", "node-b")
+    # 'colab stop' fails to unassign the vanished endpoint; the pool verifies
+    # that it is gone and also removes the leftover Colab record.
     assert gone.returncode == 0, gone.stderr
+    assert "no longer assigned on account 'beta'" in flat(gone.stderr)
     assert env.registry()["sessions"] == {}
+    assert "node-b" not in env.records("beta")
 
     created(env, "node-c", "alpha")
     forgotten = env.pool("stop", "node-c", "--forget")
     assert forgotten.returncode == 0
     assert env.registry()["sessions"] == {}
     assert "ep-node-c-alpha" in env.server_state()["alpha"]
+
+
+def forget_leftover(env, name, account, *, vanish):
+    """Leave an unpooled record behind, as 'stop --forget' does."""
+    created(env, name, account)
+    assert env.pool("stop", name, "--forget").returncode == 0
+    if vanish:
+        server = env.server_state()
+        del server[account][f"ep-{name}-{account}"]
+        env.server.write_text(json.dumps(server))
+    assert name in env.records(account)
+
+
+def test_new_reuses_name_after_leftover_record_is_confirmed_gone(env):
+    forget_leftover(env, "node-x", "alpha", vanish=True)
+
+    result = env.pool("new", "node-x", "--cached", "--account", "alpha")
+
+    assert result.returncode == 0, result.stderr
+    assert "Removed the stale Colab record of 'node-x'" in flat(result.stderr)
+    assert env.registry()["sessions"]["node-x"]["account"] == "alpha"
+    assert env.records("alpha")["node-x"]["endpoint"] == "ep-node-x-alpha"
+    assert "ep-node-x-alpha" in env.server_state()["alpha"]
+
+
+def test_new_refuses_name_whose_leftover_record_is_live_or_unverifiable(env):
+    forget_leftover(env, "node-x", "alpha", vanish=False)
+    before = env.records("alpha")
+
+    live = env.pool("new", "node-x", "--cached", "--account", "alpha")
+    assert live.returncode == 1
+    assert "still assigned on the server" in flat(live.stderr)
+    assert "pool adopt node-x alpha" in flat(live.stderr)
+    assert "pool reap alpha ep-node-x-alpha" in flat(live.stderr)
+
+    unknown = env.pool(
+        "new",
+        "node-x",
+        "--cached",
+        "--account",
+        "alpha",
+        extra_env={"FAKE_COLAB_SESSIONS_FAIL": "1"},
+    )
+    assert unknown.returncode == 1
+    assert "could not be checked" in flat(unknown.stderr)
+    assert env.records("alpha") == before
+    assert env.registry()["sessions"] == {}
+    assert [call["subcommand"] for call in env.calls()].count("new") == 1
+
+
+def test_prune_state_reports_then_removes_only_stale_records(env):
+    forget_leftover(env, "node-a", "alpha", vanish=True)
+    forget_leftover(env, "node-c", "beta", vanish=False)
+    created(env, "node-b", "beta")
+
+    failed = env.pool(
+        "prune-state", "--yes", "--json", extra_env={"FAKE_COLAB_SESSIONS_FAIL": "1"}
+    )
+    assert failed.returncode == 1
+    assert set(json.loads(failed.stdout)["errors"]) == {"alpha", "beta"}
+    assert "node-a" in env.records("alpha")
+
+    report = env.pool("prune-state", "--json")
+    assert report.returncode == 0, report.stderr
+    payload = json.loads(report.stdout)
+    assert payload["stale"] == [
+        {"account": "alpha", "name": "node-a", "endpoint": "ep-node-a-alpha"}
+    ]
+    assert payload["live"] == [
+        {"account": "beta", "name": "node-c", "endpoint": "ep-node-c-beta"}
+    ]
+    assert payload["removed"] == []
+    assert "node-a" in env.records("alpha")
+
+    table = env.pool("prune-state")
+    assert table.returncode == 0
+    assert "stale (gone from server)" in table.stdout
+    assert "prune-state --yes" in table.stdout
+
+    applied = env.pool("prune-state", "--yes")
+    assert applied.returncode == 0, applied.stderr
+    assert "removed" in applied.stdout
+    assert "node-a" not in env.records("alpha")
+    assert set(env.records("beta")) == {"node-b", "node-c"}
+    assert set(env.registry()["sessions"]) == {"node-b"}
+    assert env.pool("prune-state", "--json").returncode == 0
 
 
 def test_stop_all_stops_pooled_orphan_and_vanished_sessions(env):

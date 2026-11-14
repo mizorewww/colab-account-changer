@@ -67,6 +67,7 @@ def main() -> int:
                 "token": "proxy-secret-token",
                 "url": "https://proxy.invalid",
                 "endpoint": endpoint,
+                "token_expires_at": "2999-01-01T00:00:00Z",
                 "accelerator": hardware,
             }
             save()
@@ -96,7 +97,10 @@ def main() -> int:
                 )
     else:
         for key in list(records):
-            if records[key]["endpoint"] not in mine:
+            # Like Colab CLI, 'stop' consults the server only for a record whose
+            # proxy token has no (or a near) expiry, such as a reap placeholder.
+            fresh = subcommand == "stop" and records[key].get("token_expires_at")
+            if records[key]["endpoint"] not in mine and not fresh:
                 del records[key]
         save()
         if subcommand == "stop":
@@ -105,6 +109,9 @@ def main() -> int:
                 print(f"[colab] Session '{name}' not found.")
             elif name in failures or records[name]["endpoint"] in failures:
                 print(f"[colab] Could not stop session '{name}'.")
+                code = 1
+            elif records[name]["endpoint"] not in mine:
+                print("[colab] Unassign failed (404).", file=sys.stderr)
                 code = 1
             else:
                 del mine[records.pop(name)["endpoint"]]

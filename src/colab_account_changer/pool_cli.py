@@ -400,9 +400,75 @@ def reconcile(
         )
     if report.vanished:
         console.print(
-            "[dim]Deregister vanished sessions with [cyan]pool stop NAME[/cyan].[/dim]"
+            "[dim]Deregister vanished sessions with [cyan]pool stop NAME[/cyan]; it "
+            "also removes their local Colab records.[/dim]"
         )
     raise typer.Exit(1)
+
+
+@pool_app.command("prune-state")
+def prune_state(
+    ctx: typer.Context,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Delete the stale records (default: report)."),
+    ] = False,
+    as_json: JsonOption = False,
+) -> None:
+    """Find Colab state records that are neither pooled nor on the server.
+
+    Such leftovers block [cyan]pool new[/cyan] from reusing a name. Records
+    whose endpoint is still assigned are never touched; use
+    [cyan]pool adopt[/cyan] or [cyan]pool reap[/cyan] for those.
+    """
+    report = _pool(ctx).prune_state(apply=yes)
+    if as_json:
+        _print_json(report.to_json())
+        raise typer.Exit(1 if report.errors else 0)
+    removed = {(record.account, record.name) for record in report.removed}
+    table = Table(
+        title="Unpooled Colab state records", box=box.ROUNDED, header_style="bold cyan"
+    )
+    table.add_column("Account", style="bold")
+    table.add_column("Name", overflow="fold")
+    table.add_column("Endpoint", overflow="fold")
+    table.add_column("State")
+    for record in report.stale:
+        table.add_row(
+            Text(record.account),
+            Text(record.name),
+            Text(record.endpoint),
+            Text("removed", style="green")
+            if (record.account, record.name) in removed
+            else Text("stale (gone from server)", style="yellow"),
+        )
+    for record in report.live:
+        table.add_row(
+            Text(record.account),
+            Text(record.name),
+            Text(record.endpoint),
+            Text("live on server (kept)", style="red"),
+        )
+    if report.stale or report.live:
+        console.print(table)
+    else:
+        console.print("[green]No unpooled Colab state records found.[/green]")
+    for target, message in report.errors.items():
+        error_console.print(
+            Panel(Text(message), title=f"Could not check {target}", border_style="red")
+        )
+    if report.stale and not yes:
+        console.print(
+            "[dim]Remove the stale records with [cyan]pool prune-state --yes[/cyan]."
+            "[/dim]"
+        )
+    if report.live:
+        console.print(
+            "[dim]Register live records with [cyan]pool adopt[/cyan], or stop them "
+            "with [cyan]pool reap ACCOUNT ENDPOINT[/cyan].[/dim]"
+        )
+    if report.errors:
+        raise typer.Exit(1)
 
 
 @pool_app.command()

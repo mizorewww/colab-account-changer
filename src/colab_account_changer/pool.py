@@ -20,6 +20,7 @@ import math
 import os
 import re
 import secrets
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from filelock import ReadWriteLock, Timeout
 
 from colab_account_changer.errors import AccountChangerError, ConfigError, PoolError
 from colab_account_changer.manager import AccountManager
@@ -72,6 +75,7 @@ QUOTA_HINTS = (
 NO_SESSIONS_MESSAGE = "No active sessions found on server"
 EMPTY_CONFIRM_ATTEMPTS = 2
 EMPTY_CONFIRM_RETRY_DELAY = 1.5
+STATE_LOCK_TIMEOUT = 30.0
 
 
 def default_registry() -> dict[str, Any]:
@@ -232,6 +236,31 @@ class ReconcileReport:
             "server": [asdict(entry) for entry in self.server],
             "orphans": [asdict(entry) for entry in self.orphans],
             "vanished": [asdict(entry) for entry in self.vanished],
+            "errors": self.errors,
+        }
+
+
+@dataclass(frozen=True)
+class StateRecord:
+    account: str
+    name: str
+    endpoint: str
+
+
+@dataclass
+class PruneStateReport:
+    """Unregistered records in the pool's per-account Colab state files."""
+
+    stale: list[StateRecord] = field(default_factory=list)  # gone from server
+    live: list[StateRecord] = field(default_factory=list)  # still assigned
+    removed: list[StateRecord] = field(default_factory=list)
+    errors: dict[str, str] = field(default_factory=dict)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "stale": [asdict(record) for record in self.stale],
+            "live": [asdict(record) for record in self.live],
+            "removed": [asdict(record) for record in self.removed],
             "errors": self.errors,
         }
 
@@ -428,6 +457,83 @@ class ColabPool:
             del updated["sessions"][name]
             self.store.save(updated)
 
+    @staticmethod
+    def read_records(config: str | Path) -> dict[str, str]:
+        """Map record name -> endpoint in a Colab state file (no other fields)."""
+        try:
+            records = json.loads(Path(config).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(records, dict):
+            return {}
+        found = {}
+        for name, record in records.items():
+            endpoint = record.get("endpoint") if isinstance(record, dict) else None
+            if isinstance(name, str) and isinstance(endpoint, str) and endpoint:
+                found[name] = endpoint
+        return found
+
+    def _drop_record(self, config: str | Path, name: str, endpoint: str) -> bool:
+        """Delete ``name`` from a Colab state file if it still points at ``endpoint``.
+
+        The write happens under Colab CLI's own state-file lock (``FILE.lock``,
+        a filelock ``ReadWriteLock``) and replaces the file atomically. Records
+        hold runtime proxy tokens, so their contents are never shown.
+        """
+        path = Path(config)
+        if not path.exists():
+            return False
+        try:
+            lock = ReadWriteLock(
+                f"{path}.lock", timeout=STATE_LOCK_TIMEOUT, is_singleton=False
+            )
+            with lock.write_lock():
+                try:
+                    records = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    raise PoolError(f"Could not read Colab state file {path}.") from exc
+                if not isinstance(records, dict):
+                    raise PoolError(f"Colab state file {path} is not an object.")
+                record = records.get(name)
+                if not isinstance(record, dict) or record.get("endpoint") != endpoint:
+                    return False
+                del records[name]
+                write_private_json(path, records)
+                return True
+        except Timeout as exc:
+            raise PoolError(
+                f"Timed out waiting for the Colab state-file lock of {path}."
+            ) from exc
+        except (sqlite3.Error, ValueError, RuntimeError) as exc:
+            raise PoolError(
+                f"Could not lock Colab state file {path} ({type(exc).__name__})."
+            ) from exc
+
+    def _retire(self, session: PoolSession) -> None:
+        """Forget a session whose endpoint is confirmed gone from the server.
+
+        Removes the pool registration and the matching Colab state record, so
+        the name can be reused without an "unpooled record" conflict.
+        """
+        self._deregister(session.name)
+        if session.endpoint is None:
+            return
+        try:
+            self._drop_record(session.config, session.name, session.endpoint)
+        except AccountChangerError as exc:
+            self.notify(
+                f"Could not remove the stale Colab record of {session.name!r} "
+                f"({exc}); 'pool prune-state --yes' can remove it later."
+            )
+
+    def _confirmed_gone(self, account: str, endpoint: str) -> bool:
+        """True only if a trustworthy probe shows ``endpoint`` is unassigned."""
+        try:
+            listed = self._server_sessions(account)
+        except AccountChangerError:
+            return False
+        return all(found != endpoint for found, _ in listed)
+
     # Primary account and selection -------------------------------------
 
     def set_primary(self, account: str) -> str:
@@ -536,12 +642,7 @@ class ColabPool:
                     )
             config = self.state_file(selection.account)
             self._ensure_state_dir()
-            if self.recorded_endpoint(config, name) is not None:
-                raise PoolError(
-                    f"Account {selection.account!r} already has an unpooled Colab "
-                    f"record named {name!r}. Run 'pool reconcile', then 'pool adopt' "
-                    "or choose another name."
-                )
+            self._clear_stale_record(selection.account, config, name)
             self._activate(selection.account)
             result = self._colab(config, ["new", "-s", name, *args], capture="stderr")
             if result.stderr:
@@ -570,6 +671,38 @@ class ColabPool:
                 },
             )
             return self.get(name), selection
+
+    def _clear_stale_record(self, account: str, config: Path, name: str) -> None:
+        """Resolve an unpooled same-name record before ``colab new`` reuses it.
+
+        A record whose endpoint is confirmed gone is removed. A live endpoint,
+        or one that cannot be checked, keeps the record and refuses creation.
+        The caller holds the account lock.
+        """
+        stale = self.recorded_endpoint(config, name)
+        if stale is None:
+            return
+        try:
+            listed = self._server_sessions(account)
+        except AccountChangerError as exc:
+            raise PoolError(
+                f"Account {account!r} already has an unpooled Colab record named "
+                f"{name!r} (endpoint {stale}), and the server could not be checked "
+                f"({exc}). Not creating another session under that name; retry "
+                "later or run 'pool reconcile'."
+            ) from exc
+        if any(endpoint == stale for endpoint, _ in listed):
+            raise PoolError(
+                f"Account {account!r} already has an unpooled Colab record named "
+                f"{name!r} whose endpoint {stale} is still assigned on the server. "
+                f"Register it with 'pool adopt {name} {account} {config}', or stop "
+                f"it with 'pool reap {account} {stale}'."
+            )
+        if self._drop_record(config, name, stale):
+            self.notify(
+                f"Removed the stale Colab record of {name!r} on account "
+                f"{account!r}; endpoint {stale} is no longer assigned."
+            )
 
     def _handle_pruned_session(self, session: PoolSession) -> None:
         """Reconcile a record that a failed Colab command removed locally.
@@ -601,7 +734,7 @@ class ColabPool:
                 "'pool reconcile' before stopping or recreating it."
             )
             return
-        self._deregister(session.name)
+        self._retire(session)
         self.notify(
             f"Session {session.name!r} vanished from account "
             f"{session.account!r}; removed its stale pool registration. "
@@ -646,6 +779,16 @@ class ColabPool:
             self._activate(session.account)
             result = self._colab(session.config, ["stop", "-s", session.name])
             if result.returncode != 0:
+                if session.endpoint is not None and self._confirmed_gone(
+                    session.account, session.endpoint
+                ):
+                    self._retire(session)
+                    self.notify(
+                        f"'colab stop' failed, but endpoint {session.endpoint} is "
+                        f"no longer assigned on account {session.account!r}; "
+                        f"removed the stale registration of {session.name!r}."
+                    )
+                    return 0
                 raise PoolError(
                     f"'colab stop' failed with exit code {result.returncode}; "
                     f"{session.name!r} is still registered. Retry, or use "
@@ -868,6 +1011,59 @@ class ColabPool:
                     if session.account == account and session.endpoint not in endpoints
                 )
             return report
+
+    def prune_state(self, *, apply: bool = False) -> PruneStateReport:
+        """Find (and with ``apply``, delete) records nobody can use any more.
+
+        A record in ``pool-state/ACCOUNT.json`` that no pool registration
+        points at is *stale* when a trustworthy probe of ACCOUNT shows its
+        endpoint is unassigned, and *live* otherwise. Live records are never
+        touched; accounts that cannot be probed are reported under ``errors``.
+        """
+        report = PruneStateReport()
+        with self.hold():
+            if not self.state_dir.is_dir():
+                return report
+            registered = {
+                (Path(entry["config"]).resolve(), name)
+                for name, entry in self.store.load()["sessions"].items()
+            }
+            profiles = self._profiles()
+            for path in sorted(self.state_dir.glob("*.json")):
+                if path.name.startswith("."):
+                    continue
+                account = path.stem
+                resolved = path.resolve()
+                candidates = [
+                    StateRecord(account, name, endpoint)
+                    for name, endpoint in sorted(self.read_records(path).items())
+                    if (resolved, name) not in registered
+                ]
+                if not candidates:
+                    continue
+                if account not in profiles:
+                    report.errors[account] = "account is not a saved profile"
+                    continue
+                try:
+                    listed = {
+                        endpoint for endpoint, _ in self._server_sessions(account)
+                    }
+                except AccountChangerError as exc:
+                    report.errors[account] = str(exc)
+                    continue
+                for record in candidates:
+                    if record.endpoint in listed:
+                        report.live.append(record)
+                        continue
+                    report.stale.append(record)
+                    if not apply:
+                        continue
+                    try:
+                        if self._drop_record(path, record.name, record.endpoint):
+                            report.removed.append(record)
+                    except AccountChangerError as exc:
+                        report.errors[f"{account}/{record.name}"] = str(exc)
+        return report
 
     def reap(self, account: str, endpoint: str) -> None:
         """Stop an unpooled server-side assignment by endpoint.

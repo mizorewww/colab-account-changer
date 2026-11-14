@@ -81,6 +81,9 @@ colab-pool stop-all --yes
 
 # Check for unregistered or vanished sessions
 colab-pool reconcile
+
+# List leftover Colab records that are neither pooled nor on the server; --yes deletes them
+colab-pool prune-state
 ```
 
 `stop-all` processes accounts independently, so one failure does not block other instances. It makes at most three passes to handle failures or newly discovered instances. Success is reported only after the server has no instances, every account can be inspected, and local pool registrations are empty; otherwise remaining endpoints/accounts are listed and the command exits nonzero. Background launchers can still create new instances; this command does not kill local processes.
@@ -99,7 +102,9 @@ colab-pool primary work --threshold 3
 - Pass Colab arguments directly after the session name, as in `colab-pool exec node-x -f train.py`; do not insert an extra `--` after the name for `exec`.
 - `404/401 ... Cleaning up` means Colab CLI could not attach to the runtime and removed its local record. After a failed command, the pool checks the owning account's server assignments. If the endpoint is confirmed gone, it removes the stale registration so the same name can be recreated with `new`.
 - If the server check fails or the endpoint is still assigned, the pool preserves the registration to avoid an unmanaged VM. Run `colab-pool reconcile --all` before retrying or recreating it.
-- For an old registration already confirmed missing, run `colab-pool stop NAME` to clean it up. Do not mix raw `colab` and `colab-pool` commands on the same session; raw commands do not hold the pool's account lock.
+- For an old registration already confirmed missing, run `colab-pool stop NAME` to clean it up; even if `colab stop` fails, the registration is removed once the server confirms the endpoint is gone.
+- When a session confirmed gone is deregistered (automatic cleanup, `stop`, `stop-all`), the pool also deletes the same-name Colab record from that account's state file, so the name can be reused. `stop --forget` does not contact Colab and keeps the record; a later `new` with that name first checks the server: a vanished endpoint's record is removed and creation continues, a live endpoint is refused with an `adopt`/`reap` hint, and an unverifiable one is refused. `colab-pool prune-state` reports such leftover records on every account and deletes them only with `--yes`; records still assigned on the server are never deleted.
+- Do not mix raw `colab` and `colab-pool` commands on the same session; raw commands do not hold the pool's account lock.
 
 ## Notes
 
