@@ -107,6 +107,7 @@ colab-pool primary work --threshold 3
 - 如果服务端核对失败或 endpoint 仍存在，资源池会保留登记，避免留下无法管理的 VM。先运行 `colab-pool reconcile --all` 检查，不要盲目重复执行或重建。
 - 对已确认消失但仍保留的旧登记，运行 `colab-pool stop NAME` 清理；即使 `colab stop` 失败，只要服务端确认 endpoint 已不存在，也会注销登记。
 - 注销已确认消失的会话（自动清理、`stop`、`stop-all`）时，资源池同时删除该账号 state 文件中的同名 Colab 记录，名称可直接复用。`stop --forget` 不联系 Colab，会保留记录；之后 `new` 同名时先向服务端核实：已消失则清掉旧记录后创建，仍存在则拒绝并提示 `adopt`/`reap`，无法核实则拒绝。`colab-pool prune-state` 报告所有账号中这类残留记录，`--yes` 才删除，仍在服务端的记录永不删除。
+- `colab new` 失败但 VM 已分配（state 文件中已有 endpoint）时，资源池会立即尝试释放并向服务端确认；释放或确认失败则把它登记下来并在错误信息中说明，可用 `colab-pool stop NAME` 释放，不会留下孤儿。`colab new` 返回 0 却没有写入记录时同样报错，并提示先用 `reconcile` 查找可能的孤儿。
 - 不要混用原始 `colab` 与 `colab-pool` 操作同一个会话；原始命令不持有资源池的账号锁。
 
 ## 注意

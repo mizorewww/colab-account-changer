@@ -12,6 +12,10 @@ Failure switches (environment variables):
   on server." and exits 0; with local records it exits 1.
 - ``FAKE_COLAB_SESSIONS_FAIL=1`` / ``FAKE_COLAB_SESSIONS_GARBAGE=1``:
   ``sessions`` exits 1 / prints unparseable output with exit 0.
+- ``FAKE_COLAB_NEW_FAIL_AFTER_ASSIGN=1``: ``new`` allocates the VM and writes
+  its record, then exits 1.
+- ``FAKE_COLAB_NEW_NO_RECORD=1``: ``new`` allocates the VM, writes no record,
+  and exits 0.
 """
 
 import json
@@ -62,16 +66,21 @@ def main() -> int:
             )
             endpoint = f"ep-{name}-{account}"
             mine[endpoint] = hardware
-            records[name] = {
-                "name": name,
-                "token": "proxy-secret-token",
-                "url": "https://proxy.invalid",
-                "endpoint": endpoint,
-                "token_expires_at": "2999-01-01T00:00:00Z",
-                "accelerator": hardware,
-            }
+            if os.environ.get("FAKE_COLAB_NEW_NO_RECORD") != "1":
+                records[name] = {
+                    "name": name,
+                    "token": "proxy-secret-token",
+                    "url": "https://proxy.invalid",
+                    "endpoint": endpoint,
+                    "token_expires_at": "2999-01-01T00:00:00Z",
+                    "accelerator": hardware,
+                }
             save()
-            print("[colab] Session READY.")
+            if os.environ.get("FAKE_COLAB_NEW_FAIL_AFTER_ASSIGN") == "1":
+                print("[colab] Could not start the kernel.", file=sys.stderr)
+                code = 1
+            else:
+                print("[colab] Session READY.")
     elif subcommand == "sessions":
         if os.environ.get("FAKE_COLAB_SESSIONS_FAIL") == "1":
             print("[colab] Could not list assignments.", file=sys.stderr)

@@ -649,7 +649,15 @@ class ColabPool:
                 sys.stderr.write(result.stderr)
                 sys.stderr.flush()
             endpoint = self.recorded_endpoint(config, name)
-            if result.returncode != 0 or endpoint is None:
+            entry = {
+                "account": selection.account,
+                "config": str(config.resolve()),
+                "hardware": hardware_from_args(args),
+                "created_at": _now(),
+            }
+            if result.returncode != 0 and endpoint is not None:
+                self._release_partial(name, entry, endpoint, result.returncode)
+            if endpoint is None:
                 hint = ""
                 if any(word in (result.stderr or "") for word in QUOTA_HINTS):
                     hint = (
@@ -657,20 +665,67 @@ class ColabPool:
                         "entitlement, or capacity). Try another accelerator or "
                         "'--account ALIAS' for a different account."
                     )
+                if result.returncode == 0:
+                    raise PoolError(
+                        f"Colab reported success for session {name!r} on account "
+                        f"{selection.account!r} but wrote no session record, so "
+                        "the pool cannot manage it. A VM may still have been "
+                        "allocated: run 'pool reconcile' and stop any orphan with "
+                        "'pool reap' before retrying."
+                    )
                 raise PoolError(
                     f"Colab could not create session {name!r} on account "
                     f"{selection.account!r} (exit code {result.returncode}).{hint}",
                 )
-            self._register(
-                name,
-                {
-                    "account": selection.account,
-                    "config": str(config.resolve()),
-                    "hardware": hardware_from_args(args),
-                    "created_at": _now(),
-                },
-            )
+            self._register(name, entry)
             return self.get(name), selection
+
+    def _release_partial(
+        self, name: str, entry: dict[str, Any], endpoint: str, returncode: int
+    ) -> None:
+        """Handle ``colab new`` failing after the VM was already allocated.
+
+        Try to release the VM and confirm with a trustworthy probe. If either
+        step fails, register the session instead so it never becomes an
+        unmanaged orphan. Always raises; the caller holds the account lock.
+        """
+        account = entry["account"]
+        failure = (
+            f"Colab could not create session {name!r} on account {account!r} "
+            f"(exit code {returncode}), but a VM had already been allocated "
+            f"(endpoint {endpoint})."
+        )
+        self.notify(f"{failure} Releasing it.")
+        stop = self._colab(
+            entry["config"],
+            ["stop", "-s", name],
+            capture="both",
+            interactive=False,
+        )
+        try:
+            listed = self._server_sessions(account)
+        except AccountChangerError as exc:
+            reason = f"its release could not be verified ({exc})"
+        else:
+            if all(found != endpoint for found, _ in listed):
+                try:
+                    self._drop_record(entry["config"], name, endpoint)
+                except AccountChangerError as exc:
+                    self.notify(
+                        f"Could not remove the Colab record of {name!r} ({exc}); "
+                        "'pool prune-state --yes' can remove it later."
+                    )
+                raise PoolError(
+                    f"{failure} It was released and verified gone; nothing was "
+                    "registered."
+                )
+            reason = f"'colab stop' could not release it (exit code {stop.returncode})"
+        self._register(name, entry)
+        raise PoolError(
+            f"{failure} The pool tried to release it, but {reason}. The VM is "
+            f"registered as {name!r} so it is not orphaned; release it with "
+            f"'pool stop {name}'."
+        )
 
     def _clear_stale_record(self, account: str, config: Path, name: str) -> None:
         """Resolve an unpooled same-name record before ``colab new`` reuses it.

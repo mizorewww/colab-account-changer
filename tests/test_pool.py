@@ -599,6 +599,68 @@ def test_new_failure_is_reported_and_not_registered(env):
     assert "not a saved colab-account profile" in unknown.stderr
 
 
+def test_new_failing_after_allocation_releases_the_vm(env):
+    result = env.pool(
+        "new",
+        "node-a",
+        "--cached",
+        "--account",
+        "alpha",
+        extra_env={"FAKE_COLAB_NEW_FAIL_AFTER_ASSIGN": "1"},
+    )
+
+    assert result.returncode == 1
+    assert "already been allocated (endpoint ep-node-a-alpha)" in flat(result.stderr)
+    assert "released and verified gone" in flat(result.stderr)
+    assert env.server_state()["alpha"] == {}
+    assert env.registry()["sessions"] == {}
+    assert "node-a" not in env.records("alpha")
+    # The same name works on the next attempt.
+    created(env, "node-a", "alpha")
+
+
+def test_new_failing_after_allocation_registers_vm_it_cannot_release(env):
+    result = env.pool(
+        "new",
+        "node-a",
+        "--cached",
+        "--account",
+        "alpha",
+        extra_env={
+            "FAKE_COLAB_NEW_FAIL_AFTER_ASSIGN": "1",
+            "FAKE_COLAB_STOP_FAIL": "node-a",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "registered as 'node-a' so it is not orphaned" in flat(result.stderr)
+    assert "pool stop node-a" in flat(result.stderr)
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
+    assert "ep-node-a-alpha" in env.server_state()["alpha"]
+
+    stopped = env.pool("stop", "node-a")
+    assert stopped.returncode == 0, stopped.stderr
+    assert env.server_state()["alpha"] == {}
+    assert env.registry()["sessions"] == {}
+
+
+def test_new_success_without_record_is_an_error(env):
+    result = env.pool(
+        "new",
+        "node-a",
+        "--cached",
+        "--account",
+        "alpha",
+        extra_env={"FAKE_COLAB_NEW_NO_RECORD": "1"},
+    )
+
+    assert result.returncode == 1
+    assert "reported success" in flat(result.stderr)
+    assert "wrote no session record" in flat(result.stderr)
+    assert "pool reconcile" in flat(result.stderr)
+    assert env.registry()["sessions"] == {}
+
+
 def test_reconcile_finds_orphans_and_vanished_without_pruning(env):
     created(env, "node-a", "alpha")
     created(env, "node-b", "beta")
