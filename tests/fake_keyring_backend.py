@@ -7,6 +7,17 @@ from pathlib import Path
 from keyring.backend import KeyringBackend
 from keyring.errors import PasswordDeleteError
 
+_fake_usage_installed = False
+
+
+def _install_fake_usage():
+    """Replace usage requests in the process under test (see ``fake_usage``)."""
+    global _fake_usage_installed
+    if not _fake_usage_installed and os.environ.get("FAKE_COLAB_USAGE") == "1":
+        import fake_usage
+
+        _fake_usage_installed = fake_usage.install()
+
 
 class FileKeyring(KeyringBackend):
     priority = 1
@@ -32,6 +43,7 @@ class FileKeyring(KeyringBackend):
         return f"{service}\0{username}"
 
     def get_password(self, service, username):
+        _install_fake_usage()
         return self._read().get(self._key(service, username))
 
     def set_password(self, service, username, password):

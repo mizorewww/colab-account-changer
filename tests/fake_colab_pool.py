@@ -4,6 +4,14 @@ The active account is read from the fake keyring's upstream credential. Server
 assignments live in ``FAKE_COLAB_SERVER`` as {account: {endpoint: hardware}}.
 Like Colab CLI, every per-session command prunes local records whose endpoint
 is not assigned to the *current* account. Every call is logged as JSON lines.
+
+Failure switches (environment variables):
+
+- ``FAKE_COLAB_AUTH_FAIL=ACCOUNT[,...]``: ``sessions`` cannot log in. Like
+  Colab CLI, with an empty state file it then prints "No active sessions found
+  on server." and exits 0; with local records it exits 1.
+- ``FAKE_COLAB_SESSIONS_FAIL=1`` / ``FAKE_COLAB_SESSIONS_GARBAGE=1``:
+  ``sessions`` exits 1 / prints unparseable output with exit 0.
 """
 
 import json
@@ -42,6 +50,7 @@ def main() -> int:
         server_path.write_text(json.dumps(server))
 
     code = 0
+    auth_failed = account in os.environ.get("FAKE_COLAB_AUTH_FAIL", "").split(",")
     if subcommand == "new":
         refused = os.environ.get("FAKE_COLAB_REFUSE", "").split(",")
         if account in refused:
@@ -66,6 +75,17 @@ def main() -> int:
         if os.environ.get("FAKE_COLAB_SESSIONS_FAIL") == "1":
             print("[colab] Could not list assignments.", file=sys.stderr)
             code = 1
+        elif auth_failed and not records:
+            # Colab CLI's sync_sessions() swallows the SystemExit raised by a
+            # failed login when the local state file is empty.
+            print("[colab] No active sessions found on server.")
+        elif auth_failed:
+            print("[colab] Authentication failed.", file=sys.stderr)
+            code = 1
+        elif os.environ.get("FAKE_COLAB_SESSIONS_GARBAGE") == "1":
+            print("<html>Service temporarily unavailable</html>")
+        elif not mine:
+            print("[colab] No active sessions found on server.")
         else:
             names = {record["endpoint"]: key for key, record in records.items()}
             for endpoint, hardware in mine.items():
@@ -90,15 +110,11 @@ def main() -> int:
                 del mine[records.pop(name)["endpoint"]]
                 save()
                 print("[colab] Session terminated.")
-        elif (
-            subcommand == "exec"
-            and os.environ.get("FAKE_COLAB_PRUNE_RECORD") == "1"
-        ):
+        elif subcommand == "exec" and os.environ.get("FAKE_COLAB_PRUNE_RECORD") == "1":
             records.pop(name, None)
             save()
             print(
-                f"[colab] Session '{name}' appears to be lost (404/401). "
-                "Cleaning up."
+                f"[colab] Session '{name}' appears to be lost (404/401). Cleaning up."
             )
             code = 1
         elif name not in records:

@@ -340,9 +340,7 @@ def list_pool(
         )
     for name, message in server_report.errors.items():
         error_console.print(
-            Panel(
-                Text(message), title=f"Could not inspect {name}", border_style="red"
-            )
+            Panel(Text(message), title=f"Could not inspect {name}", border_style="red")
         )
     if server_report.errors:
         raise typer.Exit(1)

@@ -62,6 +62,7 @@ class Env:
                 "PATH": str(bin_directory),
                 "FAKE_COLAB_SERVER": str(self.server),
                 "FAKE_COLAB_LOG": str(self.log),
+                "FAKE_COLAB_USAGE": "1",
             }
         )
 
@@ -320,6 +321,77 @@ def test_pruned_record_is_retained_when_server_probe_fails(env):
     assert env.calls()[-1]["subcommand"] == "sessions"
 
 
+def test_masked_auth_failure_does_not_deregister_pruned_session(env):
+    created(env, "node-a", "alpha")
+
+    result = env.pool(
+        "exec",
+        "node-a",
+        input="1",
+        extra_env={"FAKE_COLAB_PRUNE_RECORD": "1", "FAKE_COLAB_AUTH_FAIL": "alpha"},
+    )
+
+    assert result.returncode == 1
+    assert "server state could not be verified" in result.stderr
+    assert "1 active assignment(s)" in result.stderr
+    assert "Keeping the pool registration" in result.stderr
+    assert "vanished" not in result.stderr
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
+    assert "ep-node-a-alpha" in env.server_state()["alpha"]
+
+
+@pytest.mark.parametrize(
+    "extra_env, message",
+    [
+        ({"FAKE_COLAB_AUTH_FAIL": "alpha"}, "1 active assignment(s)"),
+        (
+            {"FAKE_COLAB_AUTH_FAIL": "alpha", "FAKE_COLAB_USAGE_FAIL": "alpha"},
+            "could not be cross-checked",
+        ),
+        ({"FAKE_COLAB_SESSIONS_GARBAGE": "1"}, "neither session lines"),
+    ],
+)
+def test_reconcile_reports_untrustworthy_empty_listing(env, extra_env, message):
+    created(env, "node-a", "alpha")
+
+    result = env.pool("reconcile", "--all", "--json", extra_env=extra_env)
+
+    assert result.returncode == 1
+    report = json.loads(result.stdout)
+    assert report["consistent"] is False
+    assert "alpha" in report["errors"]
+    assert message in report["errors"]["alpha"]
+    assert [entry["name"] for entry in report["vanished"]] == []
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
+
+
+def test_empty_listing_is_trusted_when_usage_confirms_zero(env):
+    # beta's login fails, but it really has no VM: ccu-info agrees, so the
+    # listing is accepted instead of being reported as an error.
+    result = env.pool(
+        "reconcile", "--all", "--json", extra_env={"FAKE_COLAB_AUTH_FAIL": "beta"}
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert json.loads(result.stdout)["errors"] == {}
+
+
+def test_stop_all_does_not_trust_masked_auth_failure(env):
+    created(env, "node-b", "beta")
+    env.server.write_text(
+        json.dumps(dict(env.server_state(), alpha={"ep-orphan": "T4"}))
+    )
+
+    result = env.pool("stop-all", "--yes", extra_env={"FAKE_COLAB_AUTH_FAIL": "alpha"})
+
+    assert result.returncode == 1
+    assert "Could not inspect alpha" in result.stderr
+    assert "Stop-all incomplete:" in result.stderr
+    assert "Verified: no server instances" not in result.stdout
+    assert env.server_state()["alpha"] == {"ep-orphan": "T4"}
+    assert env.server_state()["beta"] == {}
+
+
 def test_stop_deregisters_even_when_server_lost_the_session(env):
     created(env, "node-a", "alpha")
     created(env, "node-b", "beta")
@@ -365,9 +437,9 @@ def test_stop_all_stops_pooled_orphan_and_vanished_sessions(env):
     assert "ep-orphan" in result.stdout
     assert "Verified: no server instances" in result.stdout
     assert env.registry()["sessions"] == {}
-    assert all(
-        not assignments for assignments in env.server_state().values()
-    ), env.server_state()
+    assert all(not assignments for assignments in env.server_state().values()), (
+        env.server_state()
+    )
     assert not list((env.config.parent / "pool-state").glob(".reap-*"))
 
 

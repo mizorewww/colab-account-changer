@@ -23,6 +23,7 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -65,6 +66,12 @@ QUOTA_HINTS = (
     "quota",
     "entitlement",
 )
+# Printed by ``colab sessions`` when the listing is empty. With an empty local
+# state file Colab CLI also prints it after swallowing an authentication
+# failure, so the pool never trusts it without an independent cross-check.
+NO_SESSIONS_MESSAGE = "No active sessions found on server"
+EMPTY_CONFIRM_ATTEMPTS = 2
+EMPTY_CONFIRM_RETRY_DELAY = 1.5
 
 
 def default_registry() -> dict[str, Any]:
@@ -341,9 +348,17 @@ class ColabPool:
         self.notify(f"Switched Colab account {previous or '(none)'} -> {account}")
 
     def _colab(
-        self, config: Path | str, args: Sequence[str], *, capture: str | None = None
+        self,
+        config: Path | str,
+        args: Sequence[str],
+        *,
+        capture: str | None = None,
+        interactive: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         options: dict[str, Any] = {"check": False, "text": True}
+        if not interactive:
+            # Internal probes must fail instead of waiting for an OAuth prompt.
+            options["stdin"] = subprocess.DEVNULL
         if capture == "stdout":
             options["stdout"] = subprocess.PIPE
         elif capture == "stderr":
@@ -734,21 +749,76 @@ class ColabPool:
         """List (endpoint, hardware) on the server; the caller holds the lock.
 
         A throw-away state file guarantees no real session record is pruned.
+        The result is either a trustworthy listing or a ``PoolError``: an empty
+        listing is accepted only after the account's own usage endpoint
+        independently reports zero assignments, because Colab CLI turns an
+        authentication failure into "no sessions" when its state file is empty.
         """
         self._ensure_state_dir()
         self._activate(account)
         with tempfile.TemporaryDirectory(prefix=".probe-", dir=self.state_dir) as tmp:
             result = self._colab(
-                Path(tmp) / "sessions.json", ["sessions"], capture="both"
+                Path(tmp) / "sessions.json",
+                ["sessions"],
+                capture="both",
+                interactive=False,
             )
         if result.returncode != 0:
             raise PoolError(f"'colab sessions' failed (exit {result.returncode}).")
         found = []
+        claimed_empty = False
+        unparsed = 0
         for line in (result.stdout or "").splitlines():
-            match = SESSION_LINE_RE.match(line.strip())
+            text = line.strip()
+            match = SESSION_LINE_RE.match(text)
             if match:
                 found.append((match["endpoint"], match["hardware"].strip().lower()))
-        return found
+            elif NO_SESSIONS_MESSAGE in text:
+                claimed_empty = True
+            elif "| Hardware:" in text:
+                unparsed += 1
+        if unparsed or (found and claimed_empty):
+            raise PoolError(
+                "'colab sessions' printed output in an unrecognized format; "
+                "server state is unknown."
+            )
+        if found:
+            return found
+        if not claimed_empty:
+            raise PoolError(
+                "'colab sessions' printed neither session lines nor its "
+                "no-sessions message; refusing to treat that as an empty server."
+            )
+        self._confirm_no_assignments(account)
+        return []
+
+    def _confirm_no_assignments(self, account: str) -> None:
+        """Cross-check an empty listing with the account's ccu-info counter."""
+        raw = self.manager.credentials.read_profile(account)
+        if raw is None:
+            raise PoolError(
+                f"'colab sessions' listed nothing on account {account!r}, and the "
+                "account has no saved credential to confirm it; server state is "
+                "unknown."
+            )
+        for attempt in range(EMPTY_CONFIRM_ATTEMPTS):
+            try:
+                usage = self.manager.usage_service.fetch(raw)
+            except AccountChangerError as exc:
+                raise PoolError(
+                    f"'colab sessions' listed nothing on account {account!r}, but "
+                    f"that could not be cross-checked ({exc}); server state is "
+                    "unknown (authentication or network failure?)."
+                ) from exc
+            if usage.assignments == 0:
+                return
+            if attempt + 1 < EMPTY_CONFIRM_ATTEMPTS:
+                time.sleep(EMPTY_CONFIRM_RETRY_DELAY)
+        raise PoolError(
+            f"'colab sessions' listed nothing on account {account!r}, but Colab "
+            f"usage reports {usage.assignments} active assignment(s); treating "
+            "the listing as failed (authentication or network failure?)."
+        )
 
     def reconcile(
         self, *, all_accounts: bool = False, refresh: bool = True
@@ -971,9 +1041,7 @@ def snapshot_json(
                 "primary": account.is_primary,
                 "active": account.is_active,
             }
-            for account, included_usage in zip(
-                snapshot.accounts, usages, strict=True
-            )
+            for account, included_usage in zip(snapshot.accounts, usages, strict=True)
         ],
         "total": {
             "balance": total.balance if total else None,
