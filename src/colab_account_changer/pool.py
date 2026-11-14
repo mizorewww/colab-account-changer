@@ -35,7 +35,12 @@ from typing import Any
 
 from filelock import ReadWriteLock, Timeout
 
-from colab_account_changer.errors import AccountChangerError, ConfigError, PoolError
+from colab_account_changer.errors import (
+    AccountChangerError,
+    ConfigError,
+    PoolCapacityError,
+    PoolError,
+)
 from colab_account_changer.manager import AccountManager
 from colab_account_changer.storage import validate_profile_name, write_private_json
 from colab_account_changer.tokens import shares_refresh_token
@@ -45,8 +50,12 @@ DEFAULT_THRESHOLD = 5.0
 DEFAULT_LOCK_TIMEOUT = 600.0
 DEFAULT_LOCK_WARN_AFTER = 120.0
 # Conservative caps against runaway "retry pool new" loops; see 'pool limits'.
-DEFAULT_MAX_SESSIONS = 12
+# The pool runs one primary account at a time, so the per-account cap is what
+# the pool can really open; the pool-wide cap leaves room for leftovers on
+# other accounts while they drain.
+DEFAULT_MAX_SESSIONS = 8
 DEFAULT_MAX_PER_ACCOUNT = 4
+MAX_EVENTS = 100
 LIMIT_KEYS = ("max_sessions", "max_per_account")
 REGISTRY_NAME = "pool.json"
 STATE_DIRECTORY = "pool-state"
@@ -70,12 +79,10 @@ SESSION_COMMANDS = (
 SESSION_LINE_RE = re.compile(
     r"^\[(?P<name>[^\]]*)\] (?P<endpoint>\S+) \| Hardware: (?P<hardware>[^|]+?) \|"
 )
-QUOTA_HINTS = (
-    "Allocation refused",
-    "Backend rejected accelerator",
-    "quota",
-    "entitlement",
-)
+# Colab's 412 refusal: too many sessions, or a usage/capacity limit.
+CAPACITY_HINTS = ("Allocation refused", "precondition failed")
+# Colab's 400 for an accelerator the account is not entitled to.
+ENTITLEMENT_HINTS = ("Backend rejected accelerator", "entitlement")
 # Printed by ``colab sessions`` when the listing is empty. With an empty local
 # state file Colab CLI also prints it after swallowing an authentication
 # failure, so the pool never trusts it without an independent cross-check.
@@ -161,6 +168,12 @@ class PoolStore:
             for key, value in limits.items():
                 if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                     raise ConfigError(f"Pool limit {key!r} must be a positive integer.")
+        events = registry.get("events")
+        if events is not None and (
+            not isinstance(events, list)
+            or not all(isinstance(event, dict) for event in events)
+        ):
+            raise ConfigError("Pool 'events' must be a list of objects.")
         sessions = registry.get("sessions")
         if not isinstance(sessions, dict):
             raise ConfigError("Pool 'sessions' must be an object.")
@@ -598,9 +611,26 @@ class ColabPool:
         with self.hold("primary"):
             account = self._require_account(account)
             registry = copy.deepcopy(self.store.load())
+            if registry["primary"] != account:
+                self._record_event(
+                    registry,
+                    "primary_changed",
+                    previous=registry["primary"],
+                    account=account,
+                    reason="set with 'pool primary'",
+                )
             registry["primary"] = account
             self.store.save(registry)
             return account
+
+    @staticmethod
+    def _record_event(registry: dict[str, Any], event: str, **details: Any) -> None:
+        """Append a non-secret event to the (mutable copy of the) registry."""
+        events = [
+            *(registry.get("events") or []),
+            {"at": _now(), "event": event, **details},
+        ]
+        registry["events"] = events[-MAX_EVENTS:]
 
     def set_threshold(self, threshold: float) -> float:
         if not math.isfinite(threshold) or threshold < 0:
@@ -652,10 +682,16 @@ class ColabPool:
                 errors[name] = str(exc)
         return errors
 
-    def _select(self) -> Selection:
-        """Stay on the primary until it drops below the threshold."""
+    def _select(self, refresh_failed: Iterable[str] = ()) -> Selection:
+        """Single-account policy: stay on the primary account.
+
+        The primary is replaced only when its balance is *confirmed* below the
+        threshold (or it is unset or has no credential). Unknown
+        usage, including a failed refresh, keeps the current primary.
+        """
         registry = self.store.load()
         profiles = self._profiles()
+        failed = set(refresh_failed)
 
         def balance(name: str) -> float | None:
             usage = profiles[name].get("usage")
@@ -673,22 +709,56 @@ class ColabPool:
             )
         primary = registry["primary"]
         threshold = registry["threshold"]
+        current = balance(primary) if primary in candidates else None
         if primary in candidates:
-            current = balance(primary)
-            if current is not None and current >= threshold:
+            if current is None or primary in failed:
+                state = (
+                    "its usage refresh failed"
+                    if primary in failed
+                    else ("it has no known usage")
+                )
+                self.notify(
+                    f"Keeping primary account {primary!r} although {state}; the "
+                    "primary changes only on a confirmed low balance."
+                )
                 return Selection(primary, None, current)
-        best = max(candidates, key=lambda name: balance(name) or float("-inf"))
-        if balance(best) is None:
-            raise PoolError(
-                "No account has a known compute-unit balance. Refresh usage "
-                "(omit --cached) or pass --account explicitly."
+            if current >= threshold:
+                return Selection(primary, None, current)
+            reason = (
+                f"its balance {current:.2f} CU is below the {threshold:g} CU threshold"
             )
-        if best != primary:
-            updated = copy.deepcopy(registry)
-            updated["primary"] = best
-            self.store.save(updated)
-            return Selection(best, primary, balance(best))
-        return Selection(best, None, balance(best))
+        elif primary is None:
+            reason = "no primary account was set"
+        else:
+            reason = f"primary account {primary!r} has no usable credential"
+        known = [
+            name
+            for name in candidates
+            if balance(name) is not None and name not in failed
+        ]
+        if not known:
+            if primary in candidates:
+                return Selection(primary, None, current)
+            raise PoolError(
+                "No account has a confirmed compute-unit balance. "
+                "Refresh usage (omit --cached) or set one with 'pool primary "
+                "ACCOUNT'."
+            )
+        best = max(known, key=lambda name: balance(name) or 0.0)
+        if best == primary:
+            return Selection(primary, None, current)
+        updated = copy.deepcopy(registry)
+        updated["primary"] = best
+        self._record_event(
+            updated, "primary_changed", previous=primary, account=best, reason=reason
+        )
+        self.store.save(updated)
+        self.notify(
+            f"Primary account changed: {primary or '(unset)'} -> {best} "
+            f"({balance(best):.2f} CU) because {reason}. New sessions are "
+            f"created on {best} from now on."
+        )
+        return Selection(best, primary, balance(best))
 
     # Session lifecycle --------------------------------------------------
 
@@ -700,6 +770,7 @@ class ColabPool:
         account: str | None = None,
         refresh: bool = True,
         if_missing: bool = False,
+        allow_other_account: bool = False,
     ) -> tuple[PoolSession, Selection]:
         """Create and register a session, or with ``if_missing`` reuse it.
 
@@ -728,18 +799,15 @@ class ColabPool:
                     "longer assigned; removed it and creating it again."
                 )
             if account is not None:
-                selection = Selection(self._require_account(account), None, None)
+                selection = self._explicit_account(account, allow_other_account)
             else:
+                failed: dict[str, str] = {}
                 if refresh:
-                    for failed, message in self.refresh_usage().items():
-                        self.notify(f"Usage unavailable for {failed}: {message}")
-                selection = self._select()
+                    failed = self.refresh_usage()
+                    for account_name, message in failed.items():
+                        self.notify(f"Usage unavailable for {account_name}: {message}")
+                selection = self._select(failed)
                 threshold = self.store.load()["threshold"]
-                if selection.repinned_from is not None:
-                    self.notify(
-                        f"Primary account {selection.repinned_from or '(unset)'} -> "
-                        f"{selection.account} ({selection.balance:.2f} CU)"
-                    )
                 if selection.balance is not None and selection.balance < threshold:
                     self.notify(
                         f"Warning: every account is below {threshold:g} CU; using "
@@ -780,12 +848,30 @@ class ColabPool:
             if result.returncode != 0 and endpoint is not None:
                 self._release_partial(name, entry, endpoint, result.returncode)
             if endpoint is None:
-                hint = ""
-                if any(word in (result.stderr or "") for word in QUOTA_HINTS):
-                    hint = (
-                        " Colab refused the allocation on this account (quota, "
-                        "entitlement, or capacity). Try another accelerator or "
-                        "'--account ALIAS' for a different account."
+                stderr = result.stderr or ""
+                if result.returncode != 0 and any(
+                    word in stderr for word in ENTITLEMENT_HINTS
+                ):
+                    raise PoolError(
+                        f"Colab rejected the requested accelerator on account "
+                        f"{selection.account!r} (no quota or entitlement for it). "
+                        "Choose another accelerator; the pool does not switch "
+                        "accounts." + self._leak_hint(selection.account, listed)
+                    )
+                if result.returncode != 0 and any(
+                    word in stderr for word in CAPACITY_HINTS
+                ):
+                    held = sum(
+                        entry["account"] == selection.account
+                        for entry in self.store.load()["sessions"].values()
+                    )
+                    raise PoolCapacityError(
+                        f"Account {selection.account!r} is full or refused the "
+                        f"allocation right now (concurrency, quota, or capacity; "
+                        f"{held} pool session(s) registered there). Stop one "
+                        "with 'pool stop NAME' or retry later. The pool does not "
+                        "switch to another account."
+                        + self._leak_hint(selection.account, listed)
                     )
                 if result.returncode == 0:
                     message = (
@@ -797,11 +883,43 @@ class ColabPool:
                     message = (
                         f"Colab could not create session {name!r} on account "
                         f"{selection.account!r} (exit code {result.returncode})."
-                        f"{hint}"
                     )
                 raise PoolError(message + self._leak_hint(selection.account, listed))
             self._register(name, entry)
             return self.get(name), selection
+
+    def _explicit_account(self, account: str, allow_other: bool) -> Selection:
+        """Apply the single-account policy to ``new --account``."""
+        account = self._require_account(account)
+        registry = self.store.load()
+        primary = registry["primary"]
+        if primary is None:
+            updated = copy.deepcopy(registry)
+            updated["primary"] = account
+            self._record_event(
+                updated,
+                "primary_changed",
+                previous=None,
+                account=account,
+                reason="set by 'pool new --account'",
+            )
+            self.store.save(updated)
+            self.notify(f"Primary account set to {account} (none was set).")
+        elif account != primary:
+            if not allow_other:
+                raise PoolError(
+                    f"The pool runs a single-account policy and the primary "
+                    f"account is {primary!r}; refusing to create on {account!r}. "
+                    f"Omit --account, change the primary with 'pool primary "
+                    f"{account}', or pass --allow-other-account for a one-off "
+                    "exception."
+                )
+            self.notify(
+                f"Warning: creating on {account!r} although the primary account "
+                f"is {primary!r} (--allow-other-account). The primary is "
+                "unchanged."
+            )
+        return Selection(account, None, None)
 
     def _still_assigned(self, session: PoolSession) -> bool:
         """Whether a registered session's endpoint is on the server.
@@ -865,7 +983,7 @@ class ColabPool:
             if orphans
             else ""
         )
-        raise PoolError(
+        raise PoolCapacityError(
             f"Refusing to create a session: {' and '.join(problems)}. "
             f"Registered sessions: {current or 'none'}.{unregistered} Reuse one "
             "('pool new --if-missing NAME'), stop one ('pool stop NAME', "

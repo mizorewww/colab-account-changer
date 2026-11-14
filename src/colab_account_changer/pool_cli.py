@@ -135,16 +135,31 @@ def new(
             ),
         ),
     ] = False,
+    allow_other_account: Annotated[
+        bool,
+        typer.Option(
+            "--allow-other-account",
+            help="Allow --account to name a non-primary account.",
+        ),
+    ] = False,
 ) -> None:
-    """Create a session on the pool's account and register it.
+    """Create a session on the pool's primary account and register it.
 
     Unknown options are passed to [cyan]colab new[/cyan], e.g.
     [cyan]pool new node-x --gpu g4[/cyan]; put them after [cyan]--[/cyan] to
-    be explicit. Creation is refused at the limits shown by
-    [cyan]pool limits[/cyan].
+    be explicit. The pool runs a single-account policy: sessions go to the
+    primary account, which changes only when its balance is confirmed below
+    the threshold. Creation is refused at the limits shown by
+    [cyan]pool limits[/cyan]; exit code 69 means the account is full or
+    refused the allocation (wait or stop a session; do not switch accounts).
     """
     session, selection = _pool(ctx).create(
-        name, args or [], account=account, refresh=not cached, if_missing=if_missing
+        name,
+        args or [],
+        account=account,
+        refresh=not cached,
+        if_missing=if_missing,
+        allow_other_account=allow_other_account,
     )
     if selection.existing:
         console.print(
@@ -409,7 +424,8 @@ def reconcile(
     as_json: JsonOption = False,
 ) -> None:
     """Compare the pool with Colab servers; exit 1 on any mismatch."""
-    report = _pool(ctx).reconcile(all_accounts=all_accounts, refresh=not cached)
+    pool = _pool(ctx)
+    report = pool.reconcile(all_accounts=all_accounts, refresh=not cached)
     if as_json:
         _print_json(report.to_json())
         raise typer.Exit(0 if report.consistent else 1)

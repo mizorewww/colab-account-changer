@@ -59,9 +59,8 @@ colab-account remove work   # Remove an inactive account
 The pool automatically switches to the account that owns each session, so you do not need to track account-to-VM mappings yourself. `colab-pool` is equivalent to `colab-account pool`.
 
 ```bash
-# Create a session with automatic account selection, or use --account
+# Create a session; it always goes to the primary account
 colab-pool new node-x --gpu g4
-colab-pool new node-y --account work
 
 # Idempotent create: do nothing (exit 0) if the name is registered and still on the server; clean up and recreate if it is confirmed gone
 colab-pool new --if-missing node-x --gpu g4
@@ -93,13 +92,17 @@ colab-pool prune-state
 
 The `list` instance table shows `pooled` (matched to a local registration), `orphan` (present on the server but unregistered), and `vanished` (a local registration no longer present on the server). Names and registration times are local; endpoints and online hardware come from server queries. The table title reports account coverage, and the command exits nonzero if any account cannot be inspected so a failed query is not mistaken for zero instances. JSON output exposes the same coverage and errors under `server_inspection`. Colab CLI can print "no sessions" and exit 0 after a failed login, so an empty listing is trusted only when the account's usage endpoint (ccu-info) also reports zero assignments. A failed usage request, a nonzero assignment count, or unparseable output counts as a failed inspection: `reconcile` lists it under `errors`, `stop-all` does not report success, and automatic cleanup keeps the registration.
 
-The pool keeps using its primary account and switches to the account with the highest balance when the primary drops below 5 CU. Set the primary account and threshold manually with:
+The pool runs a **single-account policy**: `new` creates sessions only on the primary account. It switches to the account with the highest balance only when the primary's balance is **confirmed** below the threshold (5 CU by default); unknown usage or a failed refresh keeps the current primary. A primary change prints one line and is recorded under `events` in the registry. `--account` may only name the primary (it becomes the primary if none is set); another account is refused unless you pass `--allow-other-account`, which prints a warning and leaves the primary unchanged.
+
+When the primary is full (Colab refuses the allocation for concurrency, quota, or capacity) or a limit below is reached, `new` fails with **exit code 69** and says how many sessions the account already has. Stop a session or retry later; **do not switch accounts**. An accelerator the account is not entitled to is reported as an ordinary error (exit code 1) suggesting another accelerator.
+
+Set the primary account and threshold manually with:
 
 ```bash
 colab-pool primary work --threshold 3
 ```
 
-`new` enforces limits so a "retry on failure" loop cannot keep allocating VMs: by default at most 12 sessions across the pool and 4 per account. Registered sessions count; when the target account's server listing can be trusted, its unregistered VMs count too. Over the limit, creation is refused and the current sessions are listed. Show or change the limits with:
+`new` enforces limits so a "retry on failure" loop cannot keep allocating VMs: by default at most 4 per account (what the primary can really open) and 8 across the pool (room for leftovers on other accounts while they drain). Registered sessions count; when the target account's server listing can be trusted, its unregistered VMs count too. Over the limit, creation is refused and the current sessions are listed. Show or change the limits with:
 
 ```bash
 colab-pool limits

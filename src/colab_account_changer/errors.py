@@ -29,3 +29,13 @@ class LockTimeoutError(AccountError):
 
 class PoolError(AccountChangerError):
     """A resource-pool operation cannot be completed safely."""
+
+
+class PoolCapacityError(PoolError):
+    """The account cannot take another session right now (limit or refusal).
+
+    Callers should wait and retry, or stop a session; switching to another
+    account is not the remedy.
+    """
+
+    exit_code = 69  # EX_UNAVAILABLE: distinct from lock timeouts and failures.

@@ -159,7 +159,11 @@ def flat(text):
 
 
 def created(env, name, account, *extra):
-    result = env.pool("new", name, "--cached", "--account", account, *extra)
+    # Fixtures spread sessions over accounts on purpose; the single-account
+    # policy itself is tested separately.
+    result = env.pool(
+        "new", name, "--cached", "--account", account, "--allow-other-account", *extra
+    )
     assert result.returncode == 0, result.stderr
     return result
 
@@ -198,8 +202,13 @@ def test_primary_below_threshold_is_repinned_to_richest(env):
     assert result.returncode == 0, result.stderr
     assert env.registry()["sessions"]["node-a"]["account"] == "beta"
     assert env.registry()["primary"] == "beta"
-    assert "alpha -> beta" in result.stderr
+    assert "Primary account changed: alpha -> beta" in flat(result.stderr)
+    assert "below the 5 CU threshold" in flat(result.stderr)
     assert env.active() == "beta"
+    event = env.registry()["events"][-1]
+    assert event["event"] == "primary_changed"
+    assert (event["previous"], event["account"]) == ("alpha", "beta")
+    assert "below" in event["reason"]
 
     # Above the threshold the pool stays on the pinned account.
     env.seed({"alpha": 2.0, "beta": 6.0, "gamma": 30.0}, active="beta")
@@ -594,11 +603,17 @@ def test_new_failure_is_reported_and_not_registered(env):
         extra_env={"FAKE_COLAB_REFUSE": "beta"},
     )
 
-    assert result.returncode == 1
-    assert "could not create session 'node-a' on account 'beta'" in result.stderr
-    assert "--account" in result.stderr
+    # A refusal on the primary is "full": its own exit code, and no advice
+    # to move to another account.
+    assert result.returncode == 69
+    message = flat(result.stderr)
+    assert "Account 'beta' is full or refused the allocation right now" in message
+    assert "0 pool session(s) registered there" in message
+    assert "does not switch to another account" in message
+    assert "--account" not in message
     assert "Allocation refused" in result.stderr
     assert env.registry()["sessions"] == {}
+    assert env.registry()["primary"] == "beta"
 
     unknown = env.pool("new", "node-a", "--cached", "--account", "nobody")
     assert unknown.returncode == 1
@@ -1068,10 +1083,10 @@ def test_lock_timeout_is_reported_with_retry_exit_code(env):
 def test_limits_are_shown_set_and_validated(env):
     shown = env.pool("limits", "--json")
     assert shown.returncode == 0, shown.stderr
-    assert json.loads(shown.stdout) == {"max_sessions": 12, "max_per_account": 4}
+    assert json.loads(shown.stdout) == {"max_sessions": 8, "max_per_account": 4}
 
     updated = env.pool("limits", "--max-per-account", "2", "--json")
-    assert json.loads(updated.stdout) == {"max_sessions": 12, "max_per_account": 2}
+    assert json.loads(updated.stdout) == {"max_sessions": 8, "max_per_account": 2}
     assert env.registry()["limits"] == {"max_per_account": 2}
 
     table = env.pool("limits", "--max-sessions", "3")
@@ -1091,15 +1106,17 @@ def test_new_refuses_at_limits_and_lists_current_sessions(env):
     created(env, "node-b", "alpha")
 
     per_account = env.pool("new", "node-c", "--cached", "--account", "alpha")
-    assert per_account.returncode == 1
+    assert per_account.returncode == 69
     message = flat(per_account.stderr)
     assert "account 'alpha' already has 2 (limit 2)" in message
     assert "node-a (alpha), node-b (alpha)" in message
     assert "pool limits" in message
 
     created(env, "node-c", "beta")
-    total = env.pool("new", "node-d", "--cached", "--account", "beta")
-    assert total.returncode == 1
+    total = env.pool(
+        "new", "node-d", "--cached", "--account", "beta", "--allow-other-account"
+    )
+    assert total.returncode == 69
     assert "the pool already has 3 session(s) (limit 3)" in flat(total.stderr)
     assert [call["subcommand"] for call in env.calls()].count("new") == 3
     assert set(env.registry()["sessions"]) == {"node-a", "node-b", "node-c"}
@@ -1113,7 +1130,7 @@ def test_limits_count_orphans_only_when_the_probe_is_trusted(env):
     env.server.write_text(json.dumps(server))
 
     refused = env.pool("new", "node-b", "--cached", "--account", "alpha")
-    assert refused.returncode == 1
+    assert refused.returncode == 69
     assert "account 'alpha' already has 2 (limit 2)" in flat(refused.stderr)
     assert "Unregistered VMs on 'alpha': ep-orphan" in flat(refused.stderr)
 
@@ -1134,7 +1151,7 @@ def test_retry_loop_with_drifting_names_is_bounded(env):
     # A half-created VM that cannot be released stays registered, so a loop
     # that keeps retrying 'new' under fresh names stops at the account limit.
     names = [f"node-x{suffix}" for suffix in ("", "b", "c", "d", "e", "f")]
-    for name in names:
+    for index, name in enumerate(names):
         result = env.pool(
             "new",
             name,
@@ -1146,7 +1163,7 @@ def test_retry_loop_with_drifting_names_is_bounded(env):
                 "FAKE_COLAB_STOP_FAIL": name,
             },
         )
-        assert result.returncode == 1
+        assert result.returncode == (1 if index < 4 else 69)
 
     assert [call["subcommand"] for call in env.calls()].count("new") == 4
     assert set(env.registry()["sessions"]) == set(names[:4])
@@ -1182,6 +1199,67 @@ def test_new_if_missing_reuses_live_and_recreates_vanished(env):
     assert [call["subcommand"] for call in env.calls()].count("new") == 2
     assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
     assert env.server_state()["alpha"] == {"ep-node-a-alpha": "G4"}
+
+
+def primary_changes(env):
+    return [
+        event
+        for event in env.registry().get("events", [])
+        if event["event"] == "primary_changed"
+    ]
+
+
+def test_unknown_primary_usage_never_repins(env):
+    assert env.pool("primary", "alpha").returncode == 0
+    config = json.loads(env.config.read_text())
+    del config["profiles"]["alpha"]["usage"]
+    env.config.write_text(json.dumps(config))
+
+    unknown = env.pool("new", "node-a", "--cached")
+
+    assert unknown.returncode == 0, unknown.stderr
+    assert "Keeping primary account 'alpha'" in flat(unknown.stderr)
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
+    assert env.registry()["primary"] == "alpha"
+
+
+def test_failed_usage_refresh_never_repins(env):
+    # The cached alpha balance is low, but the live refresh fails: that is not
+    # a confirmed low balance, so the primary stays.
+    env.seed({"alpha": 2.0, "beta": 100.0})
+    assert env.pool("primary", "alpha").returncode == 0
+
+    result = env.pool("new", "node-a", extra_env={"FAKE_COLAB_USAGE_FAIL": "alpha"})
+
+    assert result.returncode == 0, result.stderr
+    assert "Usage unavailable for alpha" in flat(result.stderr)
+    assert "its usage refresh failed" in flat(result.stderr)
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
+    assert env.registry()["primary"] == "alpha"
+    assert [event["account"] for event in primary_changes(env)] == ["alpha"]
+
+
+def test_new_account_must_be_the_primary_unless_allowed(env):
+    assert env.pool("primary", "alpha").returncode == 0
+
+    refused = env.pool("new", "node-b", "--cached", "--account", "beta")
+    assert refused.returncode == 1
+    message = flat(refused.stderr)
+    assert "single-account policy" in message
+    assert "primary account is 'alpha'" in message
+    assert "--allow-other-account" in message
+    assert env.calls() == []
+
+    allowed = env.pool(
+        "new", "node-b", "--cached", "--account", "beta", "--allow-other-account"
+    )
+    assert allowed.returncode == 0, allowed.stderr
+    assert "Warning: creating on 'beta'" in flat(allowed.stderr)
+    assert env.registry()["sessions"]["node-b"]["account"] == "beta"
+    assert env.registry()["primary"] == "alpha"
+
+    on_primary = env.pool("new", "node-a", "--cached", "--account", "alpha")
+    assert on_primary.returncode == 0, on_primary.stderr
 
 
 def test_hardware_label_from_new_arguments():
