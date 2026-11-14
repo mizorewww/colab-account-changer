@@ -81,6 +81,14 @@ The pool keeps using its primary account and switches to the account with the hi
 colab-pool primary work --threshold 3
 ```
 
+## Lost sessions and recovery
+
+- Prepare task code and launch scripts before creating a VM, then upload and execute immediately instead of leaving a new instance idle.
+- Pass Colab arguments directly after the session name, as in `colab-pool exec node-x -f train.py`; do not insert an extra `--` after the name for `exec`.
+- `404/401 ... Cleaning up` means Colab CLI could not attach to the runtime and removed its local record. After a failed command, the pool checks the owning account's server assignments. If the endpoint is confirmed gone, it removes the stale registration so the same name can be recreated with `new`.
+- If the server check fails or the endpoint is still assigned, the pool preserves the registration to avoid an unmanaged VM. Run `colab-pool reconcile --all` before retrying or recreating it.
+- For an old registration already confirmed missing, run `colab-pool stop NAME` to clean it up. Do not mix raw `colab` and `colab-pool` commands on the same session; raw commands do not hold the pool's account lock.
+
 ## Notes
 
 - Only the Colab CLI's default OAuth2 credentials are managed, not ADC or gcloud logins. Credentials are stored in the operating system keyring.

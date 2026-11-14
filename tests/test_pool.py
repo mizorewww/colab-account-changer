@@ -253,6 +253,72 @@ def test_arguments_stdin_and_exit_code_pass_through(env):
     assert "not in the pool" in missing.stderr
 
 
+def test_pruned_session_is_deregistered_after_server_confirms_loss(env):
+    created(env, "node-a", "alpha")
+    server = env.server_state()
+    del server["alpha"]["ep-node-a-alpha"]
+    env.server.write_text(json.dumps(server))
+
+    result = env.pool(
+        "exec",
+        "node-a",
+        input="1",
+        extra_env={"FAKE_COLAB_PRUNE_RECORD": "1"},
+    )
+
+    assert result.returncode == 1
+    assert "appears to be lost (404/401)" in result.stdout
+    assert "removed its stale pool registration" in result.stderr
+    assert "pool new node-a" in result.stderr
+    assert env.registry()["sessions"] == {}
+    assert "node-a" not in env.records("alpha")
+    assert env.calls()[-1]["subcommand"] == "sessions"
+    assert not list((env.config.parent / "pool-state").glob(".probe-*"))
+
+    # The same name can be recreated immediately after the confirmed loss.
+    created(env, "node-a", "alpha")
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
+
+
+def test_pruned_record_is_retained_while_server_assignment_survives(env):
+    created(env, "node-a", "alpha")
+
+    result = env.pool(
+        "exec",
+        "node-a",
+        input="1",
+        extra_env={"FAKE_COLAB_PRUNE_RECORD": "1"},
+    )
+
+    assert result.returncode == 1
+    assert "still assigned on account 'alpha'" in result.stderr
+    assert "Keeping the pool registration" in result.stderr
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
+    assert "node-a" not in env.records("alpha")
+    assert "ep-node-a-alpha" in env.server_state()["alpha"]
+    assert env.calls()[-1]["subcommand"] == "sessions"
+
+
+def test_pruned_record_is_retained_when_server_probe_fails(env):
+    created(env, "node-a", "alpha")
+
+    result = env.pool(
+        "exec",
+        "node-a",
+        input="1",
+        extra_env={
+            "FAKE_COLAB_PRUNE_RECORD": "1",
+            "FAKE_COLAB_SESSIONS_FAIL": "1",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "server state could not be verified" in result.stderr
+    assert "Keeping the pool registration" in result.stderr
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
+    assert env.calls()[-1]["subcommand"] == "sessions"
+
+
 def test_stop_deregisters_even_when_server_lost_the_session(env):
     created(env, "node-a", "alpha")
     created(env, "node-b", "beta")

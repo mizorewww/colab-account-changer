@@ -531,11 +531,50 @@ class ColabPool:
             )
             return self.get(name), selection
 
+    def _handle_pruned_session(self, session: PoolSession) -> None:
+        """Reconcile a record that a failed Colab command removed locally.
+
+        Colab CLI prunes a session after a terminal 404/401. Deregister only
+        after the owning account confirms that the endpoint is gone; a live
+        endpoint must remain registered so it does not become an unmanaged VM.
+        The caller holds the account lock.
+        """
+        if (
+            session.endpoint is None
+            or self.recorded_endpoint(session.config, session.name) is not None
+        ):
+            return
+        try:
+            assignments = self._server_sessions(session.account)
+        except AccountChangerError as exc:
+            self.notify(
+                f"Colab removed the local record for {session.name!r}, but its "
+                f"server state could not be verified ({exc}). Keeping the pool "
+                "registration; run 'pool reconcile'."
+            )
+            return
+        if any(endpoint == session.endpoint for endpoint, _ in assignments):
+            self.notify(
+                f"Colab removed the local record for {session.name!r}, but "
+                f"endpoint {session.endpoint} is still assigned on account "
+                f"{session.account!r}. Keeping the pool registration; run "
+                "'pool reconcile' before stopping or recreating it."
+            )
+            return
+        self._deregister(session.name)
+        self.notify(
+            f"Session {session.name!r} vanished from account "
+            f"{session.account!r}; removed its stale pool registration. "
+            f"Recreate it with 'pool new {session.name}'."
+        )
+
     def run(self, subcommand: str, name: str, args: Sequence[str] = ()) -> int:
         """Run ``colab <subcommand> -s NAME ...`` under the owning account.
 
         Standard input, output, and error are inherited, so pipes work and the
-        Colab exit code is returned unchanged.
+        Colab exit code is returned unchanged. If Colab prunes the local record
+        after a terminal error, a confirmed server-side loss is also removed
+        from the pool registry.
         """
         if subcommand in {"new", "stop", "sessions", "run"}:
             raise PoolError(
@@ -549,6 +588,8 @@ class ColabPool:
             result = self._colab(
                 session.config, [subcommand, "-s", session.name, *args]
             )
+            if result.returncode != 0:
+                self._handle_pruned_session(session)
             return result.returncode
 
     def stop(self, name: str, *, forget: bool = False) -> int:

@@ -81,6 +81,14 @@ colab-pool reconcile
 colab-pool primary work --threshold 3
 ```
 
+## 会话失联与恢复
+
+- 在任务代码和启动脚本准备好后再创建 VM，并立即上传、执行，避免新建实例长时间空闲。
+- 按名称执行时直接传 Colab 参数，例如 `colab-pool exec node-x -f train.py`；`exec` 的名称后不要额外插入 `--`。
+- `404/401 ... Cleaning up` 表示 Colab CLI 无法连接运行时并删除了本地记录。命令失败后，资源池会复查所属账号的服务端；确认 endpoint 已消失时自动注销旧登记，然后可用原名称重新 `new`。
+- 如果服务端核对失败或 endpoint 仍存在，资源池会保留登记，避免留下无法管理的 VM。先运行 `colab-pool reconcile --all` 检查，不要盲目重复执行或重建。
+- 对已确认消失但仍保留的旧登记，运行 `colab-pool stop NAME` 清理。不要混用原始 `colab` 与 `colab-pool` 操作同一个会话；原始命令不持有资源池的账号锁。
+
 ## 注意
 
 - 仅管理 Colab CLI 的默认 OAuth2 凭据，不切换 ADC 或 gcloud 登录；凭据保存在操作系统 keyring 中。

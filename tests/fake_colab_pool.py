@@ -63,13 +63,17 @@ def main() -> int:
             save()
             print("[colab] Session READY.")
     elif subcommand == "sessions":
-        names = {record["endpoint"]: key for key, record in records.items()}
-        for endpoint, hardware in mine.items():
-            label = "CPU" if hardware == "NONE" else hardware
-            print(
-                f"[{names.get(endpoint, '?')}] {endpoint} | Hardware: {label} | "
-                "Shape: Standard | Variant: DEFAULT"
-            )
+        if os.environ.get("FAKE_COLAB_SESSIONS_FAIL") == "1":
+            print("[colab] Could not list assignments.", file=sys.stderr)
+            code = 1
+        else:
+            names = {record["endpoint"]: key for key, record in records.items()}
+            for endpoint, hardware in mine.items():
+                label = "CPU" if hardware == "NONE" else hardware
+                print(
+                    f"[{names.get(endpoint, '?')}] {endpoint} | Hardware: {label} | "
+                    "Shape: Standard | Variant: DEFAULT"
+                )
     else:
         for key in list(records):
             if records[key]["endpoint"] not in mine:
@@ -82,6 +86,17 @@ def main() -> int:
                 del mine[records.pop(name)["endpoint"]]
                 save()
                 print("[colab] Session terminated.")
+        elif (
+            subcommand == "exec"
+            and os.environ.get("FAKE_COLAB_PRUNE_RECORD") == "1"
+        ):
+            records.pop(name, None)
+            save()
+            print(
+                f"[colab] Session '{name}' appears to be lost (404/401). "
+                "Cleaning up."
+            )
+            code = 1
         elif name not in records:
             print(f"[colab] Session '{name}' not found.")
             code = 1
