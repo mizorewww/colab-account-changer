@@ -80,8 +80,12 @@ def main() -> int:
                 del records[key]
         save()
         if subcommand == "stop":
+            failures = os.environ.get("FAKE_COLAB_STOP_FAIL", "").split(",")
             if name not in records:
                 print(f"[colab] Session '{name}' not found.")
+            elif name in failures or records[name]["endpoint"] in failures:
+                print(f"[colab] Could not stop session '{name}'.")
+                code = 1
             else:
                 del mine[records.pop(name)["endpoint"]]
                 save()

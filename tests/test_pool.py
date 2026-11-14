@@ -342,6 +342,72 @@ def test_stop_deregisters_even_when_server_lost_the_session(env):
     assert "ep-node-c-alpha" in env.server_state()["alpha"]
 
 
+def test_stop_all_stops_pooled_orphan_and_vanished_sessions(env):
+    created(env, "node-a", "alpha")
+    created(env, "node-b", "beta")
+    server = env.server_state()
+    del server["beta"]["ep-node-b-beta"]
+    server["beta"]["ep-orphan"] = "T4"
+    env.server.write_text(json.dumps(server))
+
+    calls_before = len(env.calls())
+    declined = env.pool("stop-all", input="n\n")
+    assert declined.returncode != 0
+    assert len(env.calls()) == calls_before
+    assert env.server_state()["alpha"]
+
+    result = env.pool("stop-all", "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert "node-a" in result.stdout
+    assert "node-b" in result.stdout
+    assert "ep-orphan" in result.stdout
+    assert "Verified: no server instances" in result.stdout
+    assert env.registry()["sessions"] == {}
+    assert all(
+        not assignments for assignments in env.server_state().values()
+    ), env.server_state()
+    assert not list((env.config.parent / "pool-state").glob(".reap-*"))
+
+
+def test_stop_all_continues_after_independent_failures(env):
+    created(env, "node-a", "alpha")
+    created(env, "node-b", "beta")
+    server = env.server_state()
+    server["beta"]["ep-orphan"] = "T4"
+    env.server.write_text(json.dumps(server))
+
+    result = env.pool(
+        "stop-all",
+        "--yes",
+        extra_env={"FAKE_COLAB_STOP_FAIL": "node-b,ep-orphan"},
+    )
+
+    assert result.returncode == 1
+    assert "node-a" in result.stdout
+    assert "ep-orphan" in result.stderr
+    assert "Remaining instance:" in result.stderr
+    assert "Stop-all incomplete:" in result.stderr
+    assert "Verified: no server instances" not in result.stdout
+    assert env.server_state()["alpha"] == {}
+    assert set(env.server_state()["beta"]) == {"ep-node-b-beta", "ep-orphan"}
+    assert set(env.registry()["sessions"]) == {"node-b"}
+
+
+def test_stop_all_does_not_claim_success_when_verification_fails(env):
+    result = env.pool(
+        "stop-all",
+        "--yes",
+        extra_env={"FAKE_COLAB_SESSIONS_FAIL": "1"},
+    )
+
+    assert result.returncode == 1
+    assert "Could not inspect alpha" in result.stderr
+    assert "Could not inspect beta" in result.stderr
+    assert "Stop-all incomplete:" in result.stderr
+    assert "Verified: no server instances" not in result.stdout
+
+
 def test_new_failure_is_reported_and_not_registered(env):
     result = env.pool(
         "new",

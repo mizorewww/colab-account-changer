@@ -229,6 +229,23 @@ class ReconcileReport:
 
 
 @dataclass(frozen=True)
+class StopAllResult:
+    final: ReconcileReport
+    remaining_sessions: list[PoolSession]
+    stopped_sessions: list[PoolSession] = field(default_factory=list)
+    reaped_orphans: list[ServerSession] = field(default_factory=list)
+    errors: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def success(self) -> bool:
+        return self.final.consistent and not self.remaining_sessions
+
+    @property
+    def stopped_count(self) -> int:
+        return len(self.stopped_sessions) + len(self.reaped_orphans)
+
+
+@dataclass(frozen=True)
 class ImportResult:
     imported: list[str]
     skipped: dict[str, str]
@@ -823,6 +840,47 @@ class ColabPool:
                 raise PoolError(
                     f"Endpoint {endpoint} is not assigned on account {account!r}."
                 )
+
+    def stop_all(self, *, max_passes: int = 3) -> StopAllResult:
+        """Stop pooled and orphan instances, then verify server and local state."""
+        if max_passes < 1:
+            raise ValueError("max_passes must be at least 1")
+        stopped_sessions: list[PoolSession] = []
+        reaped_orphans: list[ServerSession] = []
+        errors: dict[str, str] = {}
+        with self.hold():
+            for _ in range(max_passes):
+                report = self.reconcile(all_accounts=True, refresh=False)
+                registered = self.sessions()
+                if not registered and not report.orphans and not report.errors:
+                    break
+                for session in registered:
+                    key = f"session {session.name}"
+                    try:
+                        self.stop(session.name)
+                    except AccountChangerError as exc:
+                        errors[key] = str(exc)
+                    else:
+                        stopped_sessions.append(session)
+                        errors.pop(key, None)
+                for orphan in report.orphans:
+                    key = f"endpoint {orphan.endpoint} on {orphan.account}"
+                    try:
+                        self.reap(orphan.account, orphan.endpoint)
+                    except AccountChangerError as exc:
+                        errors[key] = str(exc)
+                    else:
+                        reaped_orphans.append(orphan)
+                        errors.pop(key, None)
+            final = self.reconcile(all_accounts=True, refresh=False)
+            remaining = self.sessions()
+        return StopAllResult(
+            final=final,
+            remaining_sessions=remaining,
+            stopped_sessions=stopped_sessions,
+            reaped_orphans=reaped_orphans,
+            errors=errors,
+        )
 
     # Overview -----------------------------------------------------------
 

@@ -73,12 +73,17 @@ colab-pool list
 # Skip only the usage refresh; server instances are still queried live
 colab-pool list --cached
 
-# Stop and deregister a session
-colab-pool stop node-x
+# Confirm once to stop pooled and orphan instances on every account, then verify
+colab-pool stop-all
+
+# Explicit confirmation for non-interactive scripts (all unsaved VM work is lost)
+colab-pool stop-all --yes
 
 # Check for unregistered or vanished sessions
 colab-pool reconcile
 ```
+
+`stop-all` processes accounts independently, so one failure does not block other instances. It makes at most three passes to handle failures or newly discovered instances. Success is reported only after the server has no instances, every account can be inspected, and local pool registrations are empty; otherwise remaining endpoints/accounts are listed and the command exits nonzero. Background launchers can still create new instances; this command does not kill local processes.
 
 The `list` instance table shows `pooled` (matched to a local registration), `orphan` (present on the server but unregistered), and `vanished` (a local registration no longer present on the server). Names and registration times are local; endpoints and online hardware come from server queries. The table title reports account coverage, and the command exits nonzero if any account cannot be inspected so a failed query is not mistaken for zero instances. JSON output exposes the same coverage and errors under `server_inspection`.
 

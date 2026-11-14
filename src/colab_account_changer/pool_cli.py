@@ -143,6 +143,70 @@ def stop(
     _notify(f"{name} {'forgotten' if forget else 'stopped and deregistered'}")
 
 
+@pool_app.command("stop-all")
+def stop_all_instances(
+    ctx: typer.Context,
+    yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Do not ask for confirmation.")
+    ] = False,
+) -> None:
+    """Stop every pooled and orphan VM on every saved account, then verify."""
+    if not yes and not Confirm.ask(
+        "Stop [bold]every Colab VM on every saved account[/bold]? "
+        "Unsaved work on all of them is lost.",
+        default=False,
+    ):
+        raise typer.Abort
+    result = _pool(ctx).stop_all()
+    for session in result.stopped_sessions:
+        console.print(
+            f"[green]Stopped/deregistered[/green] {escape(session.name)} "
+            f"on {escape(session.account)}"
+        )
+    for orphan in result.reaped_orphans:
+        console.print(
+            f"[green]Stopped orphan[/green] {escape(orphan.endpoint)} "
+            f"on {escape(orphan.account)}"
+        )
+    for target, message in result.errors.items():
+        error_console.print(
+            Panel(
+                Text(message),
+                title=f"Stop operation failed: {target}",
+                border_style="yellow" if result.success else "red",
+            )
+        )
+    if result.success:
+        console.print(
+            "[green]Verified: no server instances, inspection errors, or pool "
+            "registrations remain.[/green]"
+        )
+        return
+    for entry in result.final.server:
+        error_console.print(
+            f"[red]Remaining instance:[/red] {escape(entry.endpoint)} on "
+            f"{escape(entry.account)}"
+            + (f" ({escape(entry.session)})" if entry.session else " (orphan)")
+        )
+    for session in result.final.vanished:
+        error_console.print(
+            f"[yellow]Remaining stale registration:[/yellow] "
+            f"{escape(session.name)} on {escape(session.account)}"
+        )
+    for account, message in result.final.errors.items():
+        error_console.print(
+            Panel(
+                Text(message), title=f"Could not inspect {account}", border_style="red"
+            )
+        )
+    error_console.print(
+        f"[red]Stop-all incomplete:[/red] {len(result.final.server)} server "
+        f"instance(s), {len(result.remaining_sessions)} pool registration(s), "
+        f"and {len(result.final.errors)} inspection error(s) remain."
+    )
+    raise typer.Exit(1)
+
+
 def _usage_cell(value: float | None) -> Text:
     return Text("—" if value is None else f"{value:.2f}")
 
