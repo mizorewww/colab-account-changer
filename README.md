@@ -31,6 +31,8 @@ colab-account usage
 colab-account usage work
 ```
 
+列表的 **Total** 是各账号已知余额与消耗速率的合计；缺少用量数据时显示 **Known total**，不会把未知余额当作 0。**ETA** 按 `余额 ÷ 当前 CU/hr` 线性估算，当前速率为 0 且仍有余额时显示 `∞`。该估算会随实例和用量变化，并非耗尽时间保证。
+
 ### 2. 添加并切换账号
 
 ```bash

@@ -101,6 +101,7 @@ def test_usage_displays_live_compute_units(cli_manager, mocker):
     assert result.exit_code == 0
     assert "298.53 compute units" in result.stdout
     assert "0.07 CU/hr" in result.stdout
+    assert "4264.7" in result.stdout
     assert "2" in result.stdout
     cli_manager.usage_service.fetch.assert_called_once_with(make_token("personal"))
 
@@ -125,6 +126,8 @@ def test_list_usage_queries_each_profile_without_switching(
     assert result.exit_code == 0
     assert "100.00" in result.stdout
     assert "0.25" in result.stdout
+    assert "400.0" in result.stdout
+    assert "Known total (1/2 accounts)" in result.stdout
     assert "error" in result.stdout
     assert "usage denied" in result.stderr
     assert credentials.read_keyring_colab() == make_token("work")

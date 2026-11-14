@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +24,35 @@ class Usage:
     balance: float
     hourly_rate: float
     assignments: int
+
+    @property
+    def hours_remaining(self) -> float | None:
+        """Linear estimate at the current rate; ``None`` means no consumption."""
+        if self.balance <= 0:
+            return 0.0
+        if self.hourly_rate <= 0:
+            return None
+        return self.balance / self.hourly_rate
+
+
+def format_eta(usage: Usage | None) -> str:
+    """Format an ETA in hours, using infinity for a positive idle balance."""
+    if usage is None:
+        return "—"
+    hours = usage.hours_remaining
+    return "∞" if hours is None else f"{hours:.1f}"
+
+
+def total_usage(usages: Iterable[Usage | None]) -> Usage | None:
+    """Sum known usage values without treating unavailable data as zero."""
+    known = [usage for usage in usages if usage is not None]
+    if not known:
+        return None
+    return Usage(
+        balance=sum(usage.balance for usage in known),
+        hourly_rate=sum(usage.hourly_rate for usage in known),
+        assignments=sum(usage.assignments for usage in known),
+    )
 
 
 class UsageService:

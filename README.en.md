@@ -31,6 +31,8 @@ colab-account usage
 colab-account usage work
 ```
 
+**Total** sums known balances and consumption rates across accounts. If any usage is unavailable, **Known total** is shown instead of treating unknown balances as zero. **ETA** is the linear estimate `balance ÷ current CU/hr`; a positive balance with a zero rate shows `∞`. The estimate changes with assignments and usage and is not a guaranteed depletion time.
+
 ### 2. Add and switch accounts
 
 ```bash

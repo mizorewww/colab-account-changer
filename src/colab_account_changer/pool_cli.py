@@ -20,6 +20,7 @@ from colab_account_changer.pool import (
     ColabPool,
     snapshot_json,
 )
+from colab_account_changer.usage import format_eta, total_usage
 
 console = Console()
 error_console = Console(stderr=True)
@@ -160,9 +161,10 @@ def list_pool(
     accounts = Table(title="Pool accounts", box=box.ROUNDED, header_style="bold cyan")
     accounts.add_column("", width=2)
     accounts.add_column("Alias", style="bold", overflow="fold")
-    accounts.add_column("Email", overflow="fold")
-    accounts.add_column("Balance (CU)", justify="right")
+    accounts.add_column("Email", overflow="fold", no_wrap=True)
+    accounts.add_column("CU", justify="right")
     accounts.add_column("CU/hr", justify="right")
+    accounts.add_column("ETA h", justify="right")
     accounts.add_column("VMs", justify="right")
     accounts.add_column("Pooled", justify="right")
     for account in snapshot.accounts:
@@ -178,10 +180,26 @@ def list_pool(
             if account.name in snapshot.errors and not usage
             else _usage_cell(usage.balance if usage else None),
             _usage_cell(usage.hourly_rate if usage else None),
+            Text(format_eta(usage)),
             Text(str(usage.assignments)) if usage else Text("—"),
             Text(str(account.sessions)),
         )
     console.print(accounts)
+    usages = [account.usage for account in snapshot.accounts]
+    total = total_usage(usages)
+    if total is None:
+        console.print("[dim]Total CU: — (no usage data)[/dim]")
+    else:
+        known = sum(usage is not None for usage in usages)
+        label = (
+            "Total"
+            if known == len(usages)
+            else f"Known total ({known}/{len(usages)} accounts)"
+        )
+        console.print(
+            f"[bold]{label}:[/bold] {total.balance:.2f} CU  |  "
+            f"{total.hourly_rate:.2f} CU/hr  |  ETA {format_eta(total)} hr"
+        )
     console.print(
         f"[dim]★ Primary ({escape(snapshot.primary or 'unset')}; switch below "
         f"{snapshot.threshold:g} CU)  ● Active Colab account[/dim]"

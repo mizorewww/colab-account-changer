@@ -501,11 +501,24 @@ def test_list_json_and_table(env):
     assert accounts["alpha"]["pool_sessions"] == 1
     assert accounts["beta"]["balance"] == 100.0
     assert accounts["beta"]["primary"] is True
+    assert accounts["alpha"]["hours_remaining"] == pytest.approx(50.0 / 1.5)
+    assert snapshot["total"] == {
+        "balance": 150.0,
+        "hourly_rate": 3.0,
+        "hours_remaining": 50.0,
+        "assignments": 0,
+        "accounts_with_usage": 2,
+        "account_count": 2,
+        "complete": True,
+    }
 
     table = env.pool("list", "--cached")
     assert table.returncode == 0
     assert "node-a" in table.stdout
     assert "100.00" in table.stdout
+    assert "Total:" in table.stdout
+    assert "150.00" in table.stdout
+    assert "50.0" in table.stdout
 
     shown = env.pool("primary", "--json")
     assert json.loads(shown.stdout) == {"primary": "beta", "threshold": 5.0}

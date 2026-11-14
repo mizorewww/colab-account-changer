@@ -33,7 +33,7 @@ from colab_account_changer.errors import AccountChangerError, ConfigError, PoolE
 from colab_account_changer.manager import AccountManager
 from colab_account_changer.storage import validate_profile_name, write_private_json
 from colab_account_changer.tokens import shares_refresh_token
-from colab_account_changer.usage import Usage
+from colab_account_changer.usage import Usage, total_usage
 
 DEFAULT_THRESHOLD = 5.0
 DEFAULT_LOCK_TIMEOUT = 600.0
@@ -862,6 +862,8 @@ class ColabPool:
 
 
 def snapshot_json(snapshot: Snapshot) -> dict[str, Any]:
+    usages = [account.usage for account in snapshot.accounts]
+    total = total_usage(usages)
     return {
         "primary": snapshot.primary,
         "threshold": snapshot.threshold,
@@ -873,6 +875,9 @@ def snapshot_json(snapshot: Snapshot) -> dict[str, Any]:
                 "email": account.email,
                 "balance": account.usage.balance if account.usage else None,
                 "hourly_rate": account.usage.hourly_rate if account.usage else None,
+                "hours_remaining": (
+                    account.usage.hours_remaining if account.usage else None
+                ),
                 "assignments": account.usage.assignments if account.usage else None,
                 "usage_fetched_at": account.usage_fetched_at,
                 "stored": account.stored,
@@ -882,5 +887,14 @@ def snapshot_json(snapshot: Snapshot) -> dict[str, Any]:
             }
             for account in snapshot.accounts
         ],
+        "total": {
+            "balance": total.balance if total else None,
+            "hourly_rate": total.hourly_rate if total else None,
+            "hours_remaining": total.hours_remaining if total else None,
+            "assignments": total.assignments if total else None,
+            "accounts_with_usage": sum(usage is not None for usage in usages),
+            "account_count": len(usages),
+            "complete": bool(usages) and all(usage is not None for usage in usages),
+        },
         "errors": snapshot.errors,
     }

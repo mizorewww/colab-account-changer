@@ -18,6 +18,7 @@ from colab_account_changer import __version__
 from colab_account_changer.errors import AccountChangerError
 from colab_account_changer.manager import AccountManager, DiscoveryResult, Profile
 from colab_account_changer.pool_cli import pool_app
+from colab_account_changer.usage import Usage, format_eta, total_usage
 
 console = Console()
 error_console = Console(stderr=True)
@@ -106,6 +107,23 @@ def _cache_age(timestamp: str | None) -> str:
     return f"{seconds // 86400}d ago"
 
 
+def _print_usage_total(usages: list[Usage | None]) -> None:
+    total = total_usage(usages)
+    if total is None:
+        console.print("[dim]Total CU: — (no usage data)[/dim]")
+        return
+    known = sum(usage is not None for usage in usages)
+    label = (
+        "Total"
+        if known == len(usages)
+        else f"Known total ({known}/{len(usages)} accounts)"
+    )
+    console.print(
+        f"[bold]{label}:[/bold] {total.balance:.2f} CU  |  "
+        f"{total.hourly_rate:.2f} CU/hr  |  ETA {format_eta(total)} hr"
+    )
+
+
 def _render_accounts(
     manager: AccountManager,
     *,
@@ -125,6 +143,11 @@ def _render_accounts(
                 except AccountChangerError as exc:
                     usage_errors[profile.name] = str(exc)
 
+    displayed_usage = {
+        profile.name: usage_values.get(profile.name) if with_usage else profile.usage
+        for profile in profiles
+    }
+
     if not profiles:
         console.print(
             Panel(
@@ -138,13 +161,14 @@ def _render_accounts(
         table = Table(title="Colab accounts", box=box.ROUNDED, header_style="bold cyan")
         table.add_column("", width=2)
         table.add_column("Alias", style="bold", overflow="fold")
-        table.add_column("Email", overflow="fold")
-        table.add_column("Balance (CU)", justify="right")
+        table.add_column("Email", overflow="fold", no_wrap=True)
+        table.add_column("CU", justify="right")
         table.add_column("CU/hr", justify="right")
+        table.add_column("ETA h", justify="right")
         table.add_column("VMs", justify="right")
-        table.add_column("Cached", style="dim")
+        table.add_column("Age", style="dim")
         for profile in profiles:
-            usage = usage_values.get(profile.name) if with_usage else profile.usage
+            usage = displayed_usage[profile.name]
             cached_at = (
                 "just now"
                 if profile.name in usage_values
@@ -158,13 +182,16 @@ def _render_accounts(
                 if usage
                 else Text("error" if profile.name in usage_errors else "—"),
                 Text(f"{usage.hourly_rate:.2f}") if usage else Text("—"),
+                Text(format_eta(usage)),
                 Text(str(usage.assignments)) if usage else Text("—"),
                 Text(cached_at),
             ]
             table.add_row(*row)
         console.print(table)
+        _print_usage_total(list(displayed_usage.values()))
         console.print(
-            "[dim]● Active profile. Usage is cached; use --usage to refresh.[/dim]"
+            "[dim]● Active profile. Usage is cached; use --usage to refresh. "
+            "ETA = balance ÷ current rate.[/dim]"
         )
     for name, message in usage_errors.items():
         error_console.print(
@@ -252,6 +279,7 @@ def usage(
         details.add_row("Email", Text(email))
     details.add_row("Current balance", f"{value.balance:.2f} compute units")
     details.add_row("Usage rate", f"{value.hourly_rate:.2f} CU/hr")
+    details.add_row("Estimated time remaining", f"{format_eta(value)} hr")
     details.add_row("Active assignments", str(value.assignments))
     console.print(Panel(details, title="Colab usage", border_style="cyan"))
 

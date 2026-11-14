@@ -6,7 +6,13 @@ import requests
 from conftest import make_token
 
 from colab_account_changer.errors import AccountError, TokenError
-from colab_account_changer.usage import CCU_INFO_URL, Usage, UsageService
+from colab_account_changer.usage import (
+    CCU_INFO_URL,
+    Usage,
+    UsageService,
+    format_eta,
+    total_usage,
+)
 
 
 def response(status=200, body=None):
@@ -20,6 +26,20 @@ def response(status=200, body=None):
         }
     )
     return result
+
+
+def test_linear_remaining_time_and_totals():
+    assert Usage(10.0, 2.0, 1).hours_remaining == 5.0
+    assert Usage(10.0, 0.0, 0).hours_remaining is None
+    assert Usage(0.0, 0.0, 0).hours_remaining == 0.0
+    assert format_eta(Usage(10.0, 0.0, 0)) == "∞"
+    assert format_eta(None) == "—"
+
+    total = total_usage([Usage(10.0, 2.0, 1), None, Usage(30.0, 1.0, 2)])
+    assert total == Usage(40.0, 3.0, 3)
+    assert total is not None
+    assert total.hours_remaining == pytest.approx(40.0 / 3.0)
+    assert total_usage([None, None]) is None
 
 
 def test_fetch_usage_uses_the_same_colab_endpoint_and_headers():
