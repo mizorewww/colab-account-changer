@@ -745,6 +745,35 @@ def test_new_refreshes_usage_before_choosing(manager, credentials, mocker):
     assert manager.usage_service.fetch.call_count == 2
 
 
+def test_missing_active_profile_credential_cannot_substitute_current_login(env):
+    created(env, "node-a", "alpha")
+    original_server = env.server_state()
+    secrets = json.loads(env.keyring.read_text())
+    del secrets["colab-account-changer\0alpha"]
+    secrets["google-colab-cli\0oauth_token"] = fake_token("beta")
+    env.keyring.write_text(json.dumps(secrets))
+
+    result = env.pool("stop-all", "--yes")
+
+    assert result.returncode == 1
+    assert "Active profile 'alpha' has no saved credential" in result.stderr
+    assert "Verified: no server instances" not in result.stdout
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
+    assert "node-a" in env.records("alpha")
+    assert env.server_state() == original_server
+    # No Colab subprocess ran under the unrelated beta login.
+    assert [call["subcommand"] for call in env.calls()] == ["new"]
+
+    listed = env.pool("list", "--cached", "--json")
+    assert listed.returncode == 1
+    payload = json.loads(listed.stdout)
+    assert payload["server"] == []
+    assert set(payload["server_inspection"]["errors"]) == {"alpha", "beta"}
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
+    assert env.server_state() == original_server
+    assert [call["subcommand"] for call in env.calls()] == ["new"]
+
+
 def test_mismatched_upstream_credential_is_not_used(env):
     created(env, "node-a", "alpha")
     secrets = json.loads(env.keyring.read_text())

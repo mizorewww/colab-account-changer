@@ -316,7 +316,14 @@ class ColabPool:
         current = self.manager.credentials.read_colab()
         if config["active_profile"] == account and current is not None:
             saved = self.manager.credentials.read_profile(account)
-            if saved is not None and not shares_refresh_token(current, saved):
+            if saved is None:
+                raise PoolError(
+                    f"Active profile {account!r} has no saved credential. Refusing "
+                    "to use the current Colab login as a substitute; restore the "
+                    "profile credential with 'colab-account save' or switch with "
+                    "'colab-account use'."
+                )
+            if not shares_refresh_token(current, saved):
                 raise PoolError(
                     f"The active Colab credential no longer matches profile "
                     f"{account!r} (signed in outside colab-account?). Run "
