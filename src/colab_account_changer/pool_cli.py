@@ -114,16 +114,34 @@ def new(
         typer.Option("--account", help="Create on this account instead of choosing."),
     ] = None,
     cached: CachedOption = False,
+    if_missing: Annotated[
+        bool,
+        typer.Option(
+            "--if-missing",
+            help=(
+                "If NAME is registered and still on the server, do nothing "
+                "(exit 0); if it is confirmed gone, clean it up and recreate it."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Create a session on the pool's account and register it.
 
     Unknown options are passed to [cyan]colab new[/cyan], e.g.
     [cyan]pool new node-x --gpu g4[/cyan]; put them after [cyan]--[/cyan] to
-    be explicit.
+    be explicit. Creation is refused at the limits shown by
+    [cyan]pool limits[/cyan].
     """
     session, selection = _pool(ctx).create(
-        name, args or [], account=account, refresh=not cached
+        name, args or [], account=account, refresh=not cached, if_missing=if_missing
     )
+    if selection.existing:
+        console.print(
+            f"{escape(session.name)} already exists on account "
+            f"{escape(session.account)} ({escape(session.hardware)}, endpoint "
+            f"{escape(session.endpoint or 'unknown')}); not creating another."
+        )
+        return
     _notify(
         f"{session.name} created on account {selection.account} "
         f"({session.hardware}, endpoint {session.endpoint})"
@@ -570,6 +588,40 @@ def primary(
     details.add_row("Primary", Text(registry["primary"] or "unset"))
     details.add_row("Threshold", f"{registry['threshold']:g} CU")
     console.print(Panel(details, title="Pool primary", border_style="cyan"))
+
+
+@pool_app.command("limits")
+def limits_command(
+    ctx: typer.Context,
+    max_sessions: Annotated[
+        int | None,
+        typer.Option(
+            "--max-sessions", min=1, help="Most sessions across the whole pool."
+        ),
+    ] = None,
+    max_per_account: Annotated[
+        int | None,
+        typer.Option("--max-per-account", min=1, help="Most sessions per account."),
+    ] = None,
+    as_json: JsonOption = False,
+) -> None:
+    """Show or set the caps that [cyan]pool new[/cyan] enforces.
+
+    Registered sessions count, plus the target account's unregistered VMs when
+    its server listing can be trusted.
+    """
+    current = _pool(ctx).set_limits(
+        max_sessions=max_sessions, max_per_account=max_per_account
+    )
+    if as_json:
+        _print_json(current)
+        return
+    details = Table.grid(padding=(0, 2))
+    details.add_column(style="bold")
+    details.add_column()
+    details.add_row("Max sessions", str(current["max_sessions"]))
+    details.add_row("Max per account", str(current["max_per_account"]))
+    console.print(Panel(details, title="Pool limits", border_style="cyan"))
 
 
 def _passthrough(subcommand: str):

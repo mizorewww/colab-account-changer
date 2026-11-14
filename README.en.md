@@ -63,6 +63,9 @@ The pool automatically switches to the account that owns each session, so you do
 colab-pool new node-x --gpu g4
 colab-pool new node-y --account work
 
+# Idempotent create: do nothing (exit 0) if the name is registered and still on the server; clean up and recreate if it is confirmed gone
+colab-pool new --if-missing node-x --gpu g4
+
 # Run a command or upload a file to a session
 colab-pool exec node-x -f train.py
 colab-pool upload node-x data.tgz /content/data.tgz
@@ -96,11 +99,18 @@ The pool keeps using its primary account and switches to the account with the hi
 colab-pool primary work --threshold 3
 ```
 
+`new` enforces limits so a "retry on failure" loop cannot keep allocating VMs: by default at most 12 sessions across the pool and 4 per account. Registered sessions count; when the target account's server listing can be trusted, its unregistered VMs count too. Over the limit, creation is refused and the current sessions are listed. Show or change the limits with:
+
+```bash
+colab-pool limits
+colab-pool limits --max-sessions 16 --max-per-account 6
+```
+
 ## Lost sessions and recovery
 
 - Prepare task code and launch scripts before creating a VM, then upload and execute immediately instead of leaving a new instance idle.
 - Pass Colab arguments directly after the session name, as in `colab-pool exec node-x -f train.py`; do not insert an extra `--` after the name for `exec`.
-- `404/401 ... Cleaning up` means Colab CLI could not attach to the runtime and removed its local record. After a failed command, the pool checks the owning account's server assignments. If the endpoint is confirmed gone, it removes the stale registration so the same name can be recreated with `new`.
+- `404/401 ... Cleaning up` means Colab CLI could not attach to the runtime and removed its local record. After a failed command, the pool checks the owning account's server assignments. If the endpoint is confirmed gone, it removes the stale registration and local record and points to `colab-pool reconcile`; create a replacement with the same name (or `new --if-missing`) only if you still need one.
 - If the server check fails or the endpoint is still assigned, the pool preserves the registration to avoid an unmanaged VM. Run `colab-pool reconcile --all` before retrying or recreating it.
 - For an old registration already confirmed missing, run `colab-pool stop NAME` to clean it up; even if `colab stop` fails, the registration is removed once the server confirms the endpoint is gone.
 - When a session confirmed gone is deregistered (automatic cleanup, `stop`, `stop-all`), the pool also deletes the same-name Colab record from that account's state file, so the name can be reused. `stop --forget` does not contact Colab and keeps the record; a later `new` with that name first checks the server: a vanished endpoint's record is removed and creation continues, a live endpoint is refused with an `adopt`/`reap` hint, and an unverifiable one is refused. `colab-pool prune-state` reports such leftover records on every account and deletes them only with `--yes`; records still assigned on the server are never deleted.

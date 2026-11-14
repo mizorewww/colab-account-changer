@@ -181,10 +181,11 @@ def test_new_registers_on_primary_and_rejects_duplicates(env):
     assert mode == 0o600
     assert (env.config.parent / "pool-state").stat().st_mode & 0o777 == 0o700
 
+    calls_before = len(env.calls())
     duplicate = env.pool("new", "node-a", "--cached")
     assert duplicate.returncode == 1
     assert "already pooled" in duplicate.stderr
-    assert len(env.calls()) == 1
+    assert len(env.calls()) == calls_before
 
 
 def test_primary_below_threshold_is_repinned_to_richest(env):
@@ -227,7 +228,9 @@ def test_commands_switch_to_owner_without_pruning_other_accounts(env):
     third = env.pool("ls", "node-a", "/content")
     assert third.returncode == 0, third.stderr
     assert "ls node-a on alpha args=['/content']" in third.stdout
-    assert [call["account"] for call in env.calls()] == [
+    assert [
+        call["account"] for call in env.calls() if call["subcommand"] != "sessions"
+    ] == [
         "alpha",
         "beta",
         "alpha",
@@ -275,8 +278,10 @@ def test_pruned_session_is_deregistered_after_server_confirms_loss(env):
 
     assert result.returncode == 1
     assert "appears to be lost (404/401)" in result.stdout
-    assert "removed its stale pool registration" in result.stderr
-    assert "pool new node-a" in result.stderr
+    assert "Session 'node-a' vanished" in flat(result.stderr)
+    assert "registration and local Colab record were removed" in flat(result.stderr)
+    assert "pool new" not in result.stderr
+    assert "pool reconcile" in flat(result.stderr)
     assert env.registry()["sessions"] == {}
     assert "node-a" not in env.records("alpha")
     assert env.calls()[-1]["subcommand"] == "sessions"
@@ -657,7 +662,11 @@ def test_new_success_without_record_is_an_error(env):
     assert result.returncode == 1
     assert "reported success" in flat(result.stderr)
     assert "wrote no session record" in flat(result.stderr)
-    assert "pool reconcile" in flat(result.stderr)
+    assert (
+        "A new unregistered VM appeared on account 'alpha' during the attempt: "
+        "ep-node-a-alpha"
+    ) in flat(result.stderr)
+    assert "pool reap alpha ENDPOINT" in flat(result.stderr)
     assert env.registry()["sessions"] == {}
 
 
@@ -665,6 +674,7 @@ def test_reconcile_finds_orphans_and_vanished_without_pruning(env):
     created(env, "node-a", "alpha")
     created(env, "node-b", "beta")
     assert env.pool("reconcile", "--cached").returncode == 0
+    probes_from = len(env.calls())
 
     server = env.server_state()
     server["beta"]["ep-orphan"] = "T4"
@@ -683,7 +693,7 @@ def test_reconcile_finds_orphans_and_vanished_without_pruning(env):
     # The probe used a throw-away state file, so no real record was pruned.
     assert "node-a" in env.records("alpha")
     assert "node-b" in env.records("beta")
-    assert all(call["subcommand"] == "sessions" for call in env.calls()[2:])
+    assert all(call["subcommand"] == "sessions" for call in env.calls()[probes_from:])
     assert not list((env.config.parent / "pool-state").glob(".probe-*"))
 
     table = env.pool("reconcile", "--cached")
@@ -925,7 +935,126 @@ def test_lock_timeout_is_reported_with_retry_exit_code(env):
     assert result.returncode == 75
     assert "Timed out after 0.5s" in result.stderr
     assert elapsed < 30
-    assert [call["subcommand"] for call in env.calls()] == ["new"]
+    assert [call["subcommand"] for call in env.calls()] == ["sessions", "new"]
+
+
+def test_limits_are_shown_set_and_validated(env):
+    shown = env.pool("limits", "--json")
+    assert shown.returncode == 0, shown.stderr
+    assert json.loads(shown.stdout) == {"max_sessions": 12, "max_per_account": 4}
+
+    updated = env.pool("limits", "--max-per-account", "2", "--json")
+    assert json.loads(updated.stdout) == {"max_sessions": 12, "max_per_account": 2}
+    assert env.registry()["limits"] == {"max_per_account": 2}
+
+    table = env.pool("limits", "--max-sessions", "3")
+    assert table.returncode == 0
+    assert "Max sessions" in table.stdout
+    assert env.registry()["limits"] == {"max_sessions": 3, "max_per_account": 2}
+
+    invalid = env.pool("limits", "--max-sessions", "0")
+    assert invalid.returncode == 2
+    assert env.registry()["limits"]["max_sessions"] == 3
+
+
+def test_new_refuses_at_limits_and_lists_current_sessions(env):
+    limits = env.pool("limits", "--max-sessions", "3", "--max-per-account", "2")
+    assert limits.returncode == 0
+    created(env, "node-a", "alpha")
+    created(env, "node-b", "alpha")
+
+    per_account = env.pool("new", "node-c", "--cached", "--account", "alpha")
+    assert per_account.returncode == 1
+    message = flat(per_account.stderr)
+    assert "account 'alpha' already has 2 (limit 2)" in message
+    assert "node-a (alpha), node-b (alpha)" in message
+    assert "pool limits" in message
+
+    created(env, "node-c", "beta")
+    total = env.pool("new", "node-d", "--cached", "--account", "beta")
+    assert total.returncode == 1
+    assert "the pool already has 3 session(s) (limit 3)" in flat(total.stderr)
+    assert [call["subcommand"] for call in env.calls()].count("new") == 3
+    assert set(env.registry()["sessions"]) == {"node-a", "node-b", "node-c"}
+
+
+def test_limits_count_orphans_only_when_the_probe_is_trusted(env):
+    assert env.pool("limits", "--max-per-account", "2").returncode == 0
+    created(env, "node-a", "alpha")
+    server = env.server_state()
+    server["alpha"]["ep-orphan"] = "T4"
+    env.server.write_text(json.dumps(server))
+
+    refused = env.pool("new", "node-b", "--cached", "--account", "alpha")
+    assert refused.returncode == 1
+    assert "account 'alpha' already has 2 (limit 2)" in flat(refused.stderr)
+    assert "Unregistered VMs on 'alpha': ep-orphan" in flat(refused.stderr)
+
+    unverified = env.pool(
+        "new",
+        "node-b",
+        "--cached",
+        "--account",
+        "alpha",
+        extra_env={"FAKE_COLAB_SESSIONS_FAIL": "1"},
+    )
+    assert unverified.returncode == 0, unverified.stderr
+    assert "limits count registered sessions only" in flat(unverified.stderr)
+    assert set(env.registry()["sessions"]) == {"node-a", "node-b"}
+
+
+def test_retry_loop_with_drifting_names_is_bounded(env):
+    # A half-created VM that cannot be released stays registered, so a loop
+    # that keeps retrying 'new' under fresh names stops at the account limit.
+    names = [f"node-x{suffix}" for suffix in ("", "b", "c", "d", "e", "f")]
+    for name in names:
+        result = env.pool(
+            "new",
+            name,
+            "--cached",
+            "--account",
+            "alpha",
+            extra_env={
+                "FAKE_COLAB_NEW_FAIL_AFTER_ASSIGN": "1",
+                "FAKE_COLAB_STOP_FAIL": name,
+            },
+        )
+        assert result.returncode == 1
+
+    assert [call["subcommand"] for call in env.calls()].count("new") == 4
+    assert set(env.registry()["sessions"]) == set(names[:4])
+    assert len(env.server_state()["alpha"]) == 4
+    assert "(limit 4)" in flat(env.outputs[-1])
+
+
+def test_new_if_missing_reuses_live_and_recreates_vanished(env):
+    created(env, "node-a", "alpha", "--gpu", "g4")
+    if_missing = ["new", "--if-missing", "node-a", "--cached", "--account", "alpha"]
+
+    reused = env.pool(*if_missing, "--gpu", "g4")
+    assert reused.returncode == 0, reused.stderr
+    assert "node-a already exists on account alpha" in flat(reused.stdout)
+    assert "ep-node-a-alpha" in reused.stdout
+    assert [call["subcommand"] for call in env.calls()].count("new") == 1
+
+    duplicate = env.pool("new", "node-a", "--cached", "--account", "alpha")
+    assert duplicate.returncode == 1
+    assert "--if-missing" in flat(duplicate.stderr)
+
+    unknown = env.pool(*if_missing, extra_env={"FAKE_COLAB_SESSIONS_FAIL": "1"})
+    assert unknown.returncode == 1
+    assert "Not creating a duplicate" in flat(unknown.stderr)
+
+    server = env.server_state()
+    del server["alpha"]["ep-node-a-alpha"]
+    env.server.write_text(json.dumps(server))
+    recreated = env.pool(*if_missing, "--gpu", "g4")
+    assert recreated.returncode == 0, recreated.stderr
+    message = flat(recreated.stderr)
+    assert "no longer assigned; removed it and creating it again" in message
+    assert [call["subcommand"] for call in env.calls()].count("new") == 2
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
+    assert env.server_state()["alpha"] == {"ep-node-a-alpha": "G4"}
 
 
 def test_hardware_label_from_new_arguments():
@@ -1061,7 +1190,7 @@ def test_missing_active_profile_credential_cannot_substitute_current_login(env):
     assert "node-a" in env.records("alpha")
     assert env.server_state() == original_server
     # No Colab subprocess ran under the unrelated beta login.
-    assert [call["subcommand"] for call in env.calls()] == ["new"]
+    assert [call["subcommand"] for call in env.calls()] == ["sessions", "new"]
 
     listed = env.pool("list", "--cached", "--json")
     assert listed.returncode == 1
@@ -1070,7 +1199,7 @@ def test_missing_active_profile_credential_cannot_substitute_current_login(env):
     assert set(payload["server_inspection"]["errors"]) == {"alpha", "beta"}
     assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
     assert env.server_state() == original_server
-    assert [call["subcommand"] for call in env.calls()] == ["new"]
+    assert [call["subcommand"] for call in env.calls()] == ["sessions", "new"]
 
 
 def test_mismatched_upstream_credential_is_not_used(env):
@@ -1083,4 +1212,4 @@ def test_mismatched_upstream_credential_is_not_used(env):
 
     assert result.returncode == 1
     assert "no longer matches profile 'alpha'" in result.stderr
-    assert [call["subcommand"] for call in env.calls()] == ["new"]
+    assert [call["subcommand"] for call in env.calls()] == ["sessions", "new"]

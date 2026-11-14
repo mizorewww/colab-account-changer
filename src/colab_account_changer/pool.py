@@ -41,6 +41,10 @@ from colab_account_changer.usage import Usage, total_usage
 
 DEFAULT_THRESHOLD = 5.0
 DEFAULT_LOCK_TIMEOUT = 600.0
+# Conservative caps against runaway "retry pool new" loops; see 'pool limits'.
+DEFAULT_MAX_SESSIONS = 12
+DEFAULT_MAX_PER_ACCOUNT = 4
+LIMIT_KEYS = ("max_sessions", "max_per_account")
 REGISTRY_NAME = "pool.json"
 STATE_DIRECTORY = "pool-state"
 # Colab subcommands that act on one existing session selected with ``-s``.
@@ -147,6 +151,13 @@ class PoolStore:
             or threshold < 0
         ):
             raise ConfigError("Pool 'threshold' must be a non-negative number.")
+        limits = registry.get("limits")
+        if limits is not None:
+            if not isinstance(limits, dict) or set(limits) - set(LIMIT_KEYS):
+                raise ConfigError("Pool 'limits' has an unsupported format.")
+            for key, value in limits.items():
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ConfigError(f"Pool limit {key!r} must be a positive integer.")
         sessions = registry.get("sessions")
         if not isinstance(sessions, dict):
             raise ConfigError("Pool 'sessions' must be an object.")
@@ -204,6 +215,7 @@ class Selection:
     account: str
     repinned_from: str | None
     balance: float | None
+    existing: bool = False  # ``create(if_missing=True)`` reused a live session
 
 
 @dataclass(frozen=True)
@@ -553,6 +565,34 @@ class ColabPool:
             self.store.save(registry)
             return float(threshold)
 
+    @staticmethod
+    def limits(registry: dict[str, Any]) -> dict[str, int]:
+        """Effective session limits (stored values over the defaults)."""
+        stored = registry.get("limits") or {}
+        return {
+            "max_sessions": stored.get("max_sessions", DEFAULT_MAX_SESSIONS),
+            "max_per_account": stored.get("max_per_account", DEFAULT_MAX_PER_ACCOUNT),
+        }
+
+    def set_limits(
+        self, *, max_sessions: int | None = None, max_per_account: int | None = None
+    ) -> dict[str, int]:
+        changes = {
+            key: value
+            for key, value in zip(
+                LIMIT_KEYS, (max_sessions, max_per_account), strict=True
+            )
+            if value is not None
+        }
+        if any(value < 1 for value in changes.values()):
+            raise PoolError("Pool limits must be positive integers.")
+        with self.hold():
+            registry = copy.deepcopy(self.store.load())
+            if changes:
+                registry["limits"] = {**(registry.get("limits") or {}), **changes}
+                self.store.save(registry)
+            return self.limits(registry)
+
     def refresh_usage(self, accounts: Iterable[str] | None = None) -> dict[str, str]:
         """Refresh cached usage; the caller must hold the lock. Returns errors."""
         profiles = self._profiles()
@@ -613,14 +653,33 @@ class ColabPool:
         *,
         account: str | None = None,
         refresh: bool = True,
+        if_missing: bool = False,
     ) -> tuple[PoolSession, Selection]:
+        """Create and register a session, or with ``if_missing`` reuse it.
+
+        With ``if_missing``, a registered session whose endpoint is still
+        assigned is returned unchanged (``Selection.existing``); one confirmed
+        gone is cleaned up and created again. Pool limits are enforced before
+        anything is allocated.
+        """
         name = validate_session_name(name)
         with self.hold():
             existing = self.store.load()["sessions"].get(name)
             if existing is not None:
-                raise PoolError(
-                    f"Session {name!r} is already pooled on account "
-                    f"{existing['account']!r}. Use it, or 'pool stop {name}' first."
+                if not if_missing:
+                    raise PoolError(
+                        f"Session {name!r} is already pooled on account "
+                        f"{existing['account']!r}. Use it, 'pool stop {name}' "
+                        "first, or pass --if-missing to reuse it."
+                    )
+                session = self._session(name, existing)
+                if self._still_assigned(session):
+                    return session, Selection(session.account, None, None, True)
+                self._retire(session)
+                self.notify(
+                    f"Session {name!r} was registered on account "
+                    f"{session.account!r}, but endpoint {session.endpoint} is no "
+                    "longer assigned; removed it and creating it again."
                 )
             if account is not None:
                 selection = Selection(self._require_account(account), None, None)
@@ -642,7 +701,24 @@ class ColabPool:
                     )
             config = self.state_file(selection.account)
             self._ensure_state_dir()
-            self._clear_stale_record(selection.account, config, name)
+            self._check_limits(selection.account, None)
+            listed: list[tuple[str, str]] | None
+            probe_error = None
+            try:
+                listed = self._server_sessions(selection.account)
+            except AccountChangerError as exc:
+                listed, probe_error = None, str(exc)
+            self._clear_stale_record(
+                selection.account, config, name, listed, probe_error
+            )
+            if listed is None:
+                self.notify(
+                    f"Could not inspect account {selection.account!r} before "
+                    f"creating ({probe_error}); pool limits count registered "
+                    "sessions only."
+                )
+            else:
+                self._check_limits(selection.account, listed)
             self._activate(selection.account)
             result = self._colab(config, ["new", "-s", name, *args], capture="stderr")
             if result.stderr:
@@ -666,19 +742,113 @@ class ColabPool:
                         "'--account ALIAS' for a different account."
                     )
                 if result.returncode == 0:
-                    raise PoolError(
+                    message = (
                         f"Colab reported success for session {name!r} on account "
                         f"{selection.account!r} but wrote no session record, so "
-                        "the pool cannot manage it. A VM may still have been "
-                        "allocated: run 'pool reconcile' and stop any orphan with "
-                        "'pool reap' before retrying."
+                        "the pool cannot manage it."
                     )
-                raise PoolError(
-                    f"Colab could not create session {name!r} on account "
-                    f"{selection.account!r} (exit code {result.returncode}).{hint}",
-                )
+                else:
+                    message = (
+                        f"Colab could not create session {name!r} on account "
+                        f"{selection.account!r} (exit code {result.returncode})."
+                        f"{hint}"
+                    )
+                raise PoolError(message + self._leak_hint(selection.account, listed))
             self._register(name, entry)
             return self.get(name), selection
+
+    def _still_assigned(self, session: PoolSession) -> bool:
+        """Whether a registered session's endpoint is on the server.
+
+        Raises when that cannot be decided, so ``--if-missing`` never creates
+        a duplicate of a session that might still be running.
+        """
+        self._require_account(session.account)
+        if session.endpoint is None:
+            raise PoolError(
+                f"Session {session.name!r} is registered on account "
+                f"{session.account!r} but has no local Colab record, so it cannot "
+                "be checked. Run 'pool reconcile'; once it is confirmed gone, "
+                f"'pool stop {session.name}' removes the registration."
+            )
+        try:
+            listed = self._server_sessions(session.account)
+        except AccountChangerError as exc:
+            raise PoolError(
+                f"Session {session.name!r} is registered on account "
+                f"{session.account!r}, but the server could not be checked "
+                f"({exc}). Not creating a duplicate; retry later."
+            ) from exc
+        return any(endpoint == session.endpoint for endpoint, _ in listed)
+
+    def _check_limits(self, account: str, listed: list[tuple[str, str]] | None) -> None:
+        """Refuse a new session at the pool or per-account limit.
+
+        Counts registered sessions and, when ``listed`` is a trustworthy probe
+        of ``account``, that account's unregistered server assignments.
+        """
+        registry = self.store.load()
+        limits = self.limits(registry)
+        sessions = [
+            self._session(name, entry)
+            for name, entry in sorted(registry["sessions"].items())
+        ]
+        mine = [session for session in sessions if session.account == account]
+        known = {session.endpoint for session in mine if session.endpoint}
+        orphans = [endpoint for endpoint, _ in (listed or []) if endpoint not in known]
+        total = len(sessions) + len(orphans)
+        per_account = len(mine) + len(orphans)
+        problems = []
+        if total >= limits["max_sessions"]:
+            problems.append(
+                f"the pool already has {total} session(s) (limit "
+                f"{limits['max_sessions']})"
+            )
+        if per_account >= limits["max_per_account"]:
+            problems.append(
+                f"account {account!r} already has {per_account} (limit "
+                f"{limits['max_per_account']})"
+            )
+        if not problems:
+            return
+        current = ", ".join(
+            f"{session.name} ({session.account})" for session in sessions
+        )
+        unregistered = (
+            f" Unregistered VMs on {account!r}: {', '.join(orphans)}."
+            if orphans
+            else ""
+        )
+        raise PoolError(
+            f"Refusing to create a session: {' and '.join(problems)}. "
+            f"Registered sessions: {current or 'none'}.{unregistered} Reuse one "
+            "('pool new --if-missing NAME'), stop one ('pool stop NAME', "
+            "'pool reap'), or raise the limits with 'pool limits'."
+        )
+
+    def _leak_hint(self, account: str, before: list[tuple[str, str]] | None) -> str:
+        """After a failed ``colab new``, name any VM it allocated anyway."""
+        if before is None:
+            return (
+                " A VM may still have been allocated: run 'pool reconcile' "
+                "before retrying."
+            )
+        try:
+            after = self._server_sessions(account)
+        except AccountChangerError:
+            return (
+                " The server could not be checked afterwards: run 'pool "
+                "reconcile' before retrying."
+            )
+        previous = {endpoint for endpoint, _ in before}
+        leaked = [endpoint for endpoint, _ in after if endpoint not in previous]
+        if not leaked:
+            return ""
+        return (
+            f" A new unregistered VM appeared on account {account!r} during the "
+            f"attempt: {', '.join(leaked)}. Stop it with 'pool reap {account} "
+            "ENDPOINT' before retrying."
+        )
 
     def _release_partial(
         self, name: str, entry: dict[str, Any], endpoint: str, returncode: int
@@ -727,25 +897,31 @@ class ColabPool:
             f"'pool stop {name}'."
         )
 
-    def _clear_stale_record(self, account: str, config: Path, name: str) -> None:
+    def _clear_stale_record(
+        self,
+        account: str,
+        config: Path,
+        name: str,
+        listed: list[tuple[str, str]] | None,
+        probe_error: str | None,
+    ) -> None:
         """Resolve an unpooled same-name record before ``colab new`` reuses it.
 
-        A record whose endpoint is confirmed gone is removed. A live endpoint,
-        or one that cannot be checked, keeps the record and refuses creation.
-        The caller holds the account lock.
+        ``listed`` is a trustworthy probe of ``account`` taken under the
+        account lock, or ``None`` with ``probe_error``. A record whose endpoint
+        is confirmed gone is removed. A live endpoint, or one that cannot be
+        checked, keeps the record and refuses creation.
         """
         stale = self.recorded_endpoint(config, name)
         if stale is None:
             return
-        try:
-            listed = self._server_sessions(account)
-        except AccountChangerError as exc:
+        if listed is None:
             raise PoolError(
                 f"Account {account!r} already has an unpooled Colab record named "
                 f"{name!r} (endpoint {stale}), and the server could not be checked "
-                f"({exc}). Not creating another session under that name; retry "
-                "later or run 'pool reconcile'."
-            ) from exc
+                f"({probe_error}). Not creating another session under that name; "
+                "retry later or run 'pool reconcile'."
+            )
         if any(endpoint == stale for endpoint, _ in listed):
             raise PoolError(
                 f"Account {account!r} already has an unpooled Colab record named "
@@ -791,9 +967,11 @@ class ColabPool:
             return
         self._retire(session)
         self.notify(
-            f"Session {session.name!r} vanished from account "
-            f"{session.account!r}; removed its stale pool registration. "
-            f"Recreate it with 'pool new {session.name}'."
+            f"Session {session.name!r} vanished: endpoint {session.endpoint} is "
+            f"no longer assigned on account {session.account!r}, so its pool "
+            "registration and local Colab record were removed. Work on that VM "
+            "is gone. Check 'pool reconcile' before deciding whether a "
+            "replacement is needed."
         )
 
     def run(self, subcommand: str, name: str, args: Sequence[str] = ()) -> int:

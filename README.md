@@ -63,6 +63,9 @@ colab-account remove work   # 删除非活动账号
 colab-pool new node-x --gpu g4
 colab-pool new node-y --account work
 
+# 幂等新建：名称已登记且服务端仍在则什么都不做（退出码 0）；已确认消失则清理后重建
+colab-pool new --if-missing node-x --gpu g4
+
 # 在指定会话中执行命令或上传文件
 colab-pool exec node-x -f train.py
 colab-pool upload node-x data.tgz /content/data.tgz
@@ -99,11 +102,18 @@ colab-pool prune-state
 colab-pool primary work --threshold 3
 ```
 
+`new` 有数量上限，防止“失败就重试”的循环无限建机器：默认全池最多 12 个会话、每个账号最多 4 个。计数以登记表为准；目标账号的服务端清单可信时，该账号上未登记的 VM 也计入。超限时拒绝并列出当前会话。查看或修改上限：
+
+```bash
+colab-pool limits
+colab-pool limits --max-sessions 16 --max-per-account 6
+```
+
 ## 会话失联与恢复
 
 - 在任务代码和启动脚本准备好后再创建 VM，并立即上传、执行，避免新建实例长时间空闲。
 - 按名称执行时直接传 Colab 参数，例如 `colab-pool exec node-x -f train.py`；`exec` 的名称后不要额外插入 `--`。
-- `404/401 ... Cleaning up` 表示 Colab CLI 无法连接运行时并删除了本地记录。命令失败后，资源池会复查所属账号的服务端；确认 endpoint 已消失时自动注销旧登记，然后可用原名称重新 `new`。
+- `404/401 ... Cleaning up` 表示 Colab CLI 无法连接运行时并删除了本地记录。命令失败后，资源池会复查所属账号的服务端；确认 endpoint 已消失时自动注销旧登记和本地记录，并提示先看 `colab-pool reconcile`；需要替代机器时再用原名称 `new`（或 `new --if-missing`）。
 - 如果服务端核对失败或 endpoint 仍存在，资源池会保留登记，避免留下无法管理的 VM。先运行 `colab-pool reconcile --all` 检查，不要盲目重复执行或重建。
 - 对已确认消失但仍保留的旧登记，运行 `colab-pool stop NAME` 清理；即使 `colab stop` 失败，只要服务端确认 endpoint 已不存在，也会注销登记。
 - 注销已确认消失的会话（自动清理、`stop`、`stop-all`）时，资源池同时删除该账号 state 文件中的同名 Colab 记录，名称可直接复用。`stop --forget` 不联系 Colab，会保留记录；之后 `new` 同名时先向服务端核实：已消失则清掉旧记录后创建，仍存在则拒绝并提示 `adopt`/`reap`，无法核实则拒绝。`colab-pool prune-state` 报告所有账号中这类残留记录，`--yes` 才删除，仍在服务端的记录永不删除。
