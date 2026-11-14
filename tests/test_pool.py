@@ -1262,6 +1262,81 @@ def test_new_account_must_be_the_primary_unless_allowed(env):
     assert on_primary.returncode == 0, on_primary.stderr
 
 
+def test_disabled_account_is_never_used_for_new_sessions(env):
+    assert env.pool("primary", "alpha").returncode == 0
+    created(env, "node-b", "beta")
+
+    disabled = env.pool("disable", "beta", "--reason", "quota exhausted")
+    assert disabled.returncode == 0, disabled.stderr
+    assert "node-b" in disabled.stdout
+    assert env.registry()["disabled"]["beta"]["reason"] == "quota exhausted"
+
+    for extra in ([], ["--allow-other-account"]):
+        refused = env.pool("new", "node-c", "--cached", "--account", "beta", *extra)
+        assert refused.returncode == 1
+        assert "'beta' is disabled (quota exhausted)" in flat(refused.stderr)
+    as_primary = env.pool("primary", "beta")
+    assert as_primary.returncode == 1
+    assert "is disabled" in flat(as_primary.stderr)
+    outside = env.tmp / "outside.json"
+    outside.write_text(json.dumps({"x": {"endpoint": "ep-x"}}))
+    adopted = env.pool("adopt", "x", "beta", str(outside))
+    assert adopted.returncode == 1
+    assert "is disabled" in flat(adopted.stderr)
+
+    # Existing sessions on it stay usable and visible.
+    used = env.pool("exec", "node-b", input="1")
+    assert used.returncode == 0, used.stderr
+    assert "exec node-b on beta" in used.stdout
+    listed = env.pool("list", "--cached", "--json")
+    accounts = {entry["name"]: entry for entry in json.loads(listed.stdout)["accounts"]}
+    assert accounts["beta"]["disabled"] is True
+    assert accounts["beta"]["disabled_reason"] == "quota exhausted"
+    assert accounts["alpha"]["disabled"] is False
+    table = env.pool("list", "--cached")
+    assert "(disabled)" in table.stdout
+    assert "quota exhausted" in table.stdout
+    assert "Sessions on disabled accounts" in flat(table.stdout)
+    reconciled = env.pool("reconcile", "--cached")
+    assert "node-b (beta)" in flat(reconciled.stdout)
+    # The credential is kept.
+    assert "colab-account-changer\x00beta" in json.loads(env.keyring.read_text())
+
+    # Cleanup still covers the disabled account, orphans included.
+    server = env.server_state()
+    server["beta"]["ep-orphan"] = "T4"
+    env.server.write_text(json.dumps(server))
+    stopped = env.pool("stop-all", "--yes")
+    assert stopped.returncode == 0, stopped.stderr
+    assert env.server_state()["beta"] == {}
+
+    assert env.pool("enable", "beta").returncode == 0
+    assert "beta" not in env.registry()["disabled"]
+    assert env.pool("primary", "beta").returncode == 0
+
+
+def test_disabling_the_primary_picks_another_enabled_account(env):
+    env.seed({"alpha": 50.0, "beta": 100.0, "gamma": 30.0})
+    assert env.pool("primary", "beta").returncode == 0
+
+    disabled = env.pool("disable", "beta")
+    assert disabled.returncode == 0
+    assert "It was the primary account" in flat(disabled.stdout)
+    assert env.registry()["primary"] is None
+
+    result = env.pool("new", "node-a", "--cached")
+
+    assert result.returncode == 0, result.stderr
+    assert "Primary account changed: (unset) -> alpha" in flat(result.stderr)
+    assert env.registry()["primary"] == "alpha"
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
+    assert [event["account"] for event in primary_changes(env)] == [
+        "beta",
+        None,
+        "alpha",
+    ]
+
+
 def test_hardware_label_from_new_arguments():
     assert hardware_from_args(["--gpu", "G4"]) == "g4"
     assert hardware_from_args(["--tpu=v5e1"]) == "v5e1"

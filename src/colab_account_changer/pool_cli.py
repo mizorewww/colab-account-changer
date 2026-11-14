@@ -139,7 +139,7 @@ def new(
         bool,
         typer.Option(
             "--allow-other-account",
-            help="Allow --account to name a non-primary account.",
+            help="Allow --account to name a non-primary (but enabled) account.",
         ),
     ] = False,
 ) -> None:
@@ -322,7 +322,8 @@ def list_pool(
             marker.append("●", style="green")
         accounts.add_row(
             marker,
-            Text(account.name),
+            Text(account.name)
+            + (Text(" (disabled)", style="red") if account.disabled else Text("")),
             Text(account.email or "Not verified"),
             Text("error")
             if account.name in snapshot.errors and not usage
@@ -334,6 +335,17 @@ def list_pool(
             Text(usage_state),
         )
     console.print(accounts)
+    for account in snapshot.accounts:
+        if account.disabled:
+            console.print(
+                f"[red]Disabled:[/red] {escape(account.name)}"
+                + (
+                    f" — {escape(account.disabled_reason)}"
+                    if account.disabled_reason
+                    else ""
+                )
+            )
+    _disabled_hint(pool)
     usages = snapshot_usages(snapshot)
     total = total_usage(usages)
     if total is None:
@@ -453,6 +465,7 @@ def reconcile(
             Text(f"{session.name}: gone from server", style="yellow"),
         )
     console.print(table)
+    _disabled_hint(pool)
     for account, message in report.errors.items():
         error_console.print(
             Panel(
@@ -639,6 +652,58 @@ def primary(
     details.add_row("Primary", Text(registry["primary"] or "unset"))
     details.add_row("Threshold", f"{registry['threshold']:g} CU")
     console.print(Panel(details, title="Pool primary", border_style="cyan"))
+
+
+@pool_app.command()
+def disable(
+    ctx: typer.Context,
+    account: Annotated[str, typer.Argument(help="Account alias to disable.")],
+    reason: Annotated[
+        str | None, typer.Option("--reason", help="Why (shown by list).")
+    ] = None,
+) -> None:
+    """Never select or create on ACCOUNT; existing VMs stay manageable.
+
+    stop, reap, reconcile, list, stop-all, and per-session commands still
+    cover it. Its saved credential is kept.
+    """
+    pool = _pool(ctx)
+    was_primary = pool.disable(account, reason)
+    console.print(f"[yellow]Disabled[/yellow] {escape(account)}")
+    if was_primary:
+        console.print(
+            "[yellow]It was the primary account; the next 'pool new' picks the "
+            "enabled account with the highest confirmed balance, or set one with "
+            "'pool primary ACCOUNT'.[/yellow]"
+        )
+    held = [session.name for session in pool.sessions() if session.account == account]
+    if held:
+        console.print(
+            f"[dim]{len(held)} pooled session(s) remain on it: "
+            f"{escape(', '.join(held))}. Retrieve results, then 'pool stop NAME'."
+            "[/dim]"
+        )
+
+
+@pool_app.command()
+def enable(
+    ctx: typer.Context,
+    account: Annotated[str, typer.Argument(help="Account alias to enable.")],
+) -> None:
+    """Allow a disabled account to be selected again."""
+    _pool(ctx).enable(account)
+    console.print(f"[green]Enabled[/green] {escape(account)}")
+
+
+def _disabled_hint(pool: ColabPool) -> None:
+    disabled = pool.disabled_accounts(pool.store.load())
+    held = [session for session in pool.sessions() if session.account in disabled]
+    if held:
+        console.print(
+            "[yellow]Sessions on disabled accounts (retrieve results, then "
+            "'pool stop NAME'):[/yellow] "
+            + escape(", ".join(f"{s.name} ({s.account})" for s in held))
+        )
 
 
 @pool_app.command("limits")

@@ -168,6 +168,16 @@ class PoolStore:
             for key, value in limits.items():
                 if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                     raise ConfigError(f"Pool limit {key!r} must be a positive integer.")
+        disabled = registry.get("disabled")
+        if disabled is not None:
+            if not isinstance(disabled, dict):
+                raise ConfigError("Pool 'disabled' must be an object.")
+            for account, info in disabled.items():
+                if not isinstance(account, str) or not isinstance(info, dict):
+                    raise ConfigError("Pool 'disabled' has an invalid entry.")
+                reason = info.get("reason")
+                if reason is not None and not isinstance(reason, str):
+                    raise ConfigError("A disable reason must be a string.")
         events = registry.get("events")
         if events is not None and (
             not isinstance(events, list)
@@ -213,6 +223,8 @@ class AccountState:
     sessions: int
     is_primary: bool
     is_active: bool
+    disabled: bool = False
+    disabled_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -611,6 +623,7 @@ class ColabPool:
         with self.hold("primary"):
             account = self._require_account(account)
             registry = copy.deepcopy(self.store.load())
+            self._refuse_disabled(registry, account, "be the primary")
             if registry["primary"] != account:
                 self._record_event(
                     registry,
@@ -631,6 +644,62 @@ class ColabPool:
             {"at": _now(), "event": event, **details},
         ]
         registry["events"] = events[-MAX_EVENTS:]
+
+    @staticmethod
+    def disabled_accounts(registry: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        return registry.get("disabled") or {}
+
+    def _refuse_disabled(
+        self, registry: dict[str, Any], account: str, purpose: str
+    ) -> None:
+        info = self.disabled_accounts(registry).get(account)
+        if info is None:
+            return
+        reason = f" ({info['reason']})" if info.get("reason") else ""
+        raise PoolError(
+            f"Account {account!r} is disabled{reason} and cannot {purpose}. "
+            f"Re-enable it with 'pool enable {account}'."
+        )
+
+    def disable(self, account: str, reason: str | None = None) -> bool:
+        """Exclude an account from selection; returns True if it was primary.
+
+        Its credential, registrations, and server VMs are left alone, so stop,
+        reap, reconcile, list, and stop-all still cover it.
+        """
+        with self.hold(f"disable {account}"):
+            account = self._require_account(account)
+            registry = copy.deepcopy(self.store.load())
+            registry.setdefault("disabled", {})[account] = {
+                "reason": reason,
+                "disabled_at": _now(),
+            }
+            self._record_event(registry, "account_disabled", account=account)
+            was_primary = registry["primary"] == account
+            if was_primary:
+                registry["primary"] = None
+                self._record_event(
+                    registry,
+                    "primary_changed",
+                    previous=account,
+                    account=None,
+                    reason="the primary account was disabled",
+                )
+            self.store.save(registry)
+            return was_primary
+
+    def enable(self, account: str) -> None:
+        try:
+            account = validate_profile_name(account)
+        except ValueError as exc:
+            raise PoolError(str(exc)) from exc
+        with self.hold(f"enable {account}"):
+            registry = copy.deepcopy(self.store.load())
+            if account not in self.disabled_accounts(registry):
+                raise PoolError(f"Account {account!r} is not disabled.")
+            del registry["disabled"][account]
+            self._record_event(registry, "account_enabled", account=account)
+            self.store.save(registry)
 
     def set_threshold(self, threshold: float) -> float:
         if not math.isfinite(threshold) or threshold < 0:
@@ -686,11 +755,13 @@ class ColabPool:
         """Single-account policy: stay on the primary account.
 
         The primary is replaced only when its balance is *confirmed* below the
-        threshold (or it is unset or has no credential). Unknown
+        threshold (or it is unset, disabled, or has no credential). Unknown
         usage, including a failed refresh, keeps the current primary.
+        Disabled accounts are never chosen.
         """
         registry = self.store.load()
         profiles = self._profiles()
+        disabled = self.disabled_accounts(registry)
         failed = set(refresh_failed)
 
         def balance(name: str) -> float | None:
@@ -700,12 +771,13 @@ class ColabPool:
         candidates = [
             name
             for name in sorted(profiles)
-            if self.manager.credentials.read_profile(name) is not None
+            if name not in disabled
+            and self.manager.credentials.read_profile(name) is not None
         ]
         if not candidates:
             raise PoolError(
-                "No saved account with a stored credential is available. "
-                "Add one with 'colab-account add NAME'."
+                "No enabled saved account with a stored credential is available. "
+                "Add one with 'colab-account add NAME' or 'pool enable ACCOUNT'."
             )
         primary = registry["primary"]
         threshold = registry["threshold"]
@@ -729,6 +801,8 @@ class ColabPool:
             )
         elif primary is None:
             reason = "no primary account was set"
+        elif primary in disabled:
+            reason = f"primary account {primary!r} is disabled"
         else:
             reason = f"primary account {primary!r} has no usable credential"
         known = [
@@ -740,7 +814,7 @@ class ColabPool:
             if primary in candidates:
                 return Selection(primary, None, current)
             raise PoolError(
-                "No account has a confirmed compute-unit balance. "
+                "No enabled account has a confirmed compute-unit balance. "
                 "Refresh usage (omit --cached) or set one with 'pool primary "
                 "ACCOUNT'."
             )
@@ -892,6 +966,7 @@ class ColabPool:
         """Apply the single-account policy to ``new --account``."""
         account = self._require_account(account)
         registry = self.store.load()
+        self._refuse_disabled(registry, account, "take new sessions")
         primary = registry["primary"]
         if primary is None:
             updated = copy.deepcopy(registry)
@@ -1245,6 +1320,7 @@ class ColabPool:
         path = Path(config).expanduser().resolve()
         with self.hold(f"adopt {name}"):
             account = self._require_account(account)
+            self._refuse_disabled(self.store.load(), account, "adopt sessions")
             existing = self.store.load()["sessions"].get(name)
             if existing is not None:
                 raise PoolError(
@@ -1616,6 +1692,12 @@ class ColabPool:
                     sessions=counts.get(profile.name, 0),
                     is_primary=profile.name == registry["primary"],
                     is_active=profile.is_active,
+                    disabled=profile.name in self.disabled_accounts(registry),
+                    disabled_reason=(
+                        self.disabled_accounts(registry)
+                        .get(profile.name, {})
+                        .get("reason")
+                    ),
                 )
             )
         return Snapshot(
@@ -1671,6 +1753,8 @@ def snapshot_json(
                 "pool_sessions": account.sessions,
                 "primary": account.is_primary,
                 "active": account.is_active,
+                "disabled": account.disabled,
+                "disabled_reason": account.disabled_reason,
             }
             for account, included_usage in zip(snapshot.accounts, usages, strict=True)
         ],

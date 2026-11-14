@@ -96,6 +96,13 @@ The pool runs a **single-account policy**: `new` creates sessions only on the pr
 
 When the primary is full (Colab refuses the allocation for concurrency, quota, or capacity) or a limit below is reached, `new` fails with **exit code 69** and says how many sessions the account already has. Stop a session or retry later; **do not switch accounts**. An accelerator the account is not entitled to is reported as an ordinary error (exit code 1) suggesting another accelerator.
 
+Disable an account you no longer want used: automatic selection never picks it and it cannot become the primary (disabling the current primary clears it, and the next `new` picks another by the rules above and says so). `new --account` (even with `--allow-other-account`), `adopt`, and `import` refuse it. `stop`, `reap`, `reconcile`, `list`, `stop-all`, and per-session commands for its registered sessions still cover it, so you can retrieve results and stop its VMs; `list` marks it `disabled` with the reason, and `list`/`reconcile` point out sessions still on disabled accounts. Disabling never deletes the credential.
+
+```bash
+colab-pool disable old-account --reason "quota exhausted"
+colab-pool enable old-account
+```
+
 Set the primary account and threshold manually with:
 
 ```bash

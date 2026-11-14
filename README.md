@@ -99,6 +99,13 @@ colab-pool prune-state
 
 主账号满了（Colab 拒绝分配：并发、配额或容量）或达到下面的数量上限时，`new` 以**退出码 69** 失败，并说明该账号已有几个会话。这时请停掉一个会话或稍后重试，**不要换账号**。所请求的加速器无权使用时则以普通错误（退出码 1）提示换加速器。
 
+不再使用的账号可以禁用：自动选择永不选它，它也不能成为主账号（禁用当前主账号时会清空主账号，下次 `new` 按规则另选并提示）；`new --account`（即使加 `--allow-other-account`）、`adopt`、`import` 指向它都会被拒绝。`stop`、`reap`、`reconcile`、`list`、`stop-all` 以及已登记会话的按名称命令仍覆盖它，方便取回结果并停机；`list` 标出 `disabled` 和原因，`list`/`reconcile` 会提示仍留在禁用账号上的会话。禁用不会删除凭据。
+
+```bash
+colab-pool disable old-account --reason "quota exhausted"
+colab-pool enable old-account
+```
+
 可手动设置主账号和切换阈值：
 
 ```bash
