@@ -3,6 +3,7 @@
 Nothing here touches the real Colab CLI, keyring, or account configuration.
 """
 
+import contextlib
 import itertools
 import json
 import os
@@ -901,27 +902,152 @@ def test_list_reports_partial_server_inspection_failure(env):
     assert set(snapshot["server_inspection"]["errors"]) == {"alpha", "beta"}
 
 
-def test_concurrent_commands_are_serialized_on_the_right_account(env):
+def exec_calls(env):
+    calls = [call for call in env.calls() if call["subcommand"] == "exec"]
+    return sorted(calls, key=lambda call: call["start"])
+
+
+def lock_holders(env):
+    holders = []
+    for path in (env.config.parent / "lock-holders").glob("*.json"):
+        # A file can be replaced or removed while it is read.
+        with contextlib.suppress(OSError, ValueError):
+            holders.append(json.loads(path.read_text()))
+    return holders
+
+
+def wait_for_holder(env, label, *, waiting=False, timeout=60):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for holder in lock_holders(env):
+            if holder["label"] == f"pool {label}" and holder["waiting"] is waiting:
+                return holder
+        time.sleep(0.05)
+    raise AssertionError(f"no lock holder {label!r} (waiting={waiting})")
+
+
+def finish(*processes):
+    for process in processes:
+        _, stderr = process.communicate(timeout=120)
+        assert process.returncode == 0, stderr
+        assert "Traceback" not in stderr
+
+
+def test_concurrent_commands_never_overlap_across_accounts(env):
     created(env, "node-a", "alpha")
     created(env, "node-b", "beta")
     delay = {"FAKE_COLAB_DELAY": "1"}
 
-    processes = [
-        env.pool("exec", name, background=True, extra_env=delay)
-        for name in ("node-a", "node-b", "node-a")
-    ]
-    for process in processes:
-        stdout, stderr = process.communicate(timeout=60)
-        assert process.returncode == 0, stderr
-        assert "exec node-" in stdout
+    finish(
+        *[
+            env.pool("exec", name, background=True, extra_env=delay)
+            for name in ("node-a", "node-b", "node-a")
+        ]
+    )
 
-    calls = [call for call in env.calls() if call["subcommand"] == "exec"]
+    calls = exec_calls(env)
     assert len(calls) == 3
     for call in calls:
         assert call["account"] == {"node-a": "alpha", "node-b": "beta"}[call["name"]]
-    calls.sort(key=lambda call: call["start"])
-    for earlier, later in itertools.pairwise(calls):
-        assert earlier["end"] <= later["start"]
+    for earlier, later in itertools.combinations(calls, 2):
+        if earlier["account"] != later["account"]:
+            assert earlier["end"] <= later["start"] or later["end"] <= earlier["start"]
+
+
+def test_same_account_commands_share_the_lock(env):
+    created(env, "node-a", "alpha")
+    created(env, "node-b", "alpha")
+    delay = {"FAKE_COLAB_DELAY": "3"}
+
+    finish(
+        env.pool("exec", "node-a", background=True, extra_env=delay),
+        env.pool("exec", "node-b", background=True, extra_env=delay),
+    )
+
+    first, second = exec_calls(env)
+    assert first["account"] == second["account"] == "alpha"
+    assert second["start"] < first["end"]  # They ran concurrently.
+    assert lock_holders(env) == []
+
+
+def test_waiting_account_switch_is_not_starved_by_shared_holders(env):
+    created(env, "node-b", "beta")
+    created(env, "node-a", "alpha")  # alpha is now the active account.
+
+    reader = env.pool(
+        "exec", "node-a", background=True, extra_env={"FAKE_COLAB_DELAY": "3"}
+    )
+    wait_for_holder(env, "exec node-a")
+    switcher = env.pool("exec", "node-b", background=True)
+    wait_for_holder(env, "exec node-b", waiting=True)
+    # Without writer preference this would join the running alpha command.
+    late_reader = env.pool("exec", "node-a", background=True)
+    finish(reader, switcher, late_reader)
+
+    first, switch, late = exec_calls(env)
+    assert (first["account"], switch["account"], late["account"]) == (
+        "alpha",
+        "beta",
+        "alpha",
+    )
+    assert switch["name"] == "node-b"
+    assert first["end"] <= switch["start"]
+    assert switch["end"] <= late["start"]
+
+
+def test_busy_pool_timeout_names_holder_and_says_nothing_is_lost(env):
+    created(env, "node-a", "alpha")
+    reader = env.pool(
+        "exec", "node-a", background=True, extra_env={"FAKE_COLAB_DELAY": "4"}
+    )
+    holder = wait_for_holder(env, "exec node-a")
+
+    assert set(holder) == {"pid", "mode", "waiting", "label", "started_at"}
+    assert holder["mode"] == "shared"
+    raw = "".join(
+        path.read_text() for path in (env.config.parent / "lock-holders").glob("*.json")
+    )
+    for secret in ("fake-access-", "refresh-", "proxy-secret-token", "client-secret"):
+        assert secret not in raw
+
+    shown = env.pool("status")
+    assert shown.returncode == 0, shown.stderr
+    assert "pool exec node-a" in shown.stdout
+    assert "shared" in shown.stdout
+
+    started = time.monotonic()
+    timed_out = env.pool("--lock-timeout", "0.5", "reconcile", "--cached")
+    assert time.monotonic() - started < 30
+    finish(reader)
+
+    assert timed_out.returncode == 75
+    message = flat(timed_out.stderr)
+    assert "The pool is busy" in message
+    assert "'pool exec node-a' (held shared for" in message
+    assert "does not mean any Colab session was lost" in message
+    assert "do not recreate sessions" in message
+    assert "sessions" not in [call["subcommand"] for call in env.calls()[2:]]
+    assert lock_holders(env) == []
+
+
+def test_long_lock_hold_warns_once_without_killing_the_command(env):
+    created(env, "node-a", "alpha")
+
+    result = env.pool(
+        "--lock-warn-after",
+        "0.5",
+        "exec",
+        "node-a",
+        input="1",
+        extra_env={"FAKE_COLAB_DELAY": "1.5"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "exec node-a on alpha" in result.stdout
+    message = flat(result.stderr)
+    assert message.count("has held the pool lock") == 1
+    assert "'exec node-a' has held the pool lock (shared)" in message
+    assert "Avoid moving large files through colab-pool" in message
 
 
 def test_lock_timeout_is_reported_with_retry_exit_code(env):
@@ -934,6 +1060,7 @@ def test_lock_timeout_is_reported_with_retry_exit_code(env):
 
     assert result.returncode == 75
     assert "Timed out after 0.5s" in result.stderr
+    assert "do not recreate sessions" in flat(result.stderr)
     assert elapsed < 30
     assert [call["subcommand"] for call in env.calls()] == ["sessions", "new"]
 

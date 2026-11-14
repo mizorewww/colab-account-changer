@@ -24,8 +24,10 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,6 +43,7 @@ from colab_account_changer.usage import Usage, total_usage
 
 DEFAULT_THRESHOLD = 5.0
 DEFAULT_LOCK_TIMEOUT = 600.0
+DEFAULT_LOCK_WARN_AFTER = 120.0
 # Conservative caps against runaway "retry pool new" loops; see 'pool limits'.
 DEFAULT_MAX_SESSIONS = 12
 DEFAULT_MAX_PER_ACCOUNT = 4
@@ -311,6 +314,7 @@ class ColabPool:
         colab_command: str = "colab",
         verify: bool = True,
         lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
+        lock_warn_after: float = DEFAULT_LOCK_WARN_AFTER,
         runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
         notify: Callable[[str], None] | None = None,
     ) -> None:
@@ -318,6 +322,7 @@ class ColabPool:
         self.colab_command = colab_command
         self.verify = verify
         self.lock_timeout = lock_timeout
+        self.lock_warn_after = lock_warn_after
         self.runner = runner or subprocess.run
         self.notify = notify or (lambda message: None)
         self.root = self.manager.config.path.parent
@@ -326,16 +331,57 @@ class ColabPool:
 
     # Locking and account switching -------------------------------------
 
-    def hold(self):
-        """The account lock, held across a switch and the Colab subprocess."""
-        return self.manager.exclusive(
-            timeout=self.lock_timeout,
-            message=(
-                f"Timed out after {self.lock_timeout:g}s waiting for the account "
-                f"lock ({self.manager.lock_path}). Another pool or colab-account "
-                "command is still running; retry later or raise --lock-timeout."
-            ),
+    def _lock_message(self) -> str:
+        return (
+            f"Timed out after {self.lock_timeout:g}s waiting for the account "
+            f"lock ({self.manager.lock_path}). Another pool or colab-account "
+            "command is still running; retry later or raise --lock-timeout."
         )
+
+    @contextmanager
+    def hold(self, label: str = "pool"):
+        """The account lock, held exclusively across switches and subprocesses."""
+        with self._access(None, label):
+            yield
+
+    @contextmanager
+    def _access(self, can_share: Callable[[], bool] | None, label: str):
+        """Hold the account lock (shared if ``can_share()``); warn when slow."""
+        outer = self.manager.lock_mode is None
+        with self.manager.access(
+            can_share,
+            timeout=self.lock_timeout,
+            message=self._lock_message(),
+            label=f"pool {label}",
+        ) as mode:
+            timer = None
+            if outer and self.lock_warn_after > 0:
+                timer = threading.Timer(
+                    self.lock_warn_after, self._warn_held, args=(label, mode)
+                )
+                timer.daemon = True
+                timer.start()
+            try:
+                yield mode
+            finally:
+                if timer is not None:
+                    timer.cancel()
+
+    def _warn_held(self, label: str, mode: str) -> None:
+        waiting = (
+            "commands that need another account are waiting"
+            if mode == "shared"
+            else "every other pool command is waiting"
+        )
+        self.notify(
+            f"'{label}' has held the pool lock ({mode}) for more than "
+            f"{self.lock_warn_after:g}s; {waiting}. The command keeps running. "
+            "Avoid moving large files through colab-pool."
+        )
+
+    def lock_holders(self) -> list[dict[str, Any]]:
+        """Current holders of the account lock (read without locking)."""
+        return self.manager.lock_holders()
 
     def _ensure_state_dir(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -549,7 +595,7 @@ class ColabPool:
     # Primary account and selection -------------------------------------
 
     def set_primary(self, account: str) -> str:
-        with self.hold():
+        with self.hold("primary"):
             account = self._require_account(account)
             registry = copy.deepcopy(self.store.load())
             registry["primary"] = account
@@ -559,7 +605,7 @@ class ColabPool:
     def set_threshold(self, threshold: float) -> float:
         if not math.isfinite(threshold) or threshold < 0:
             raise PoolError("The threshold must be a non-negative number.")
-        with self.hold():
+        with self.hold("primary"):
             registry = copy.deepcopy(self.store.load())
             registry["threshold"] = float(threshold)
             self.store.save(registry)
@@ -586,7 +632,7 @@ class ColabPool:
         }
         if any(value < 1 for value in changes.values()):
             raise PoolError("Pool limits must be positive integers.")
-        with self.hold():
+        with self.hold("limits"):
             registry = copy.deepcopy(self.store.load())
             if changes:
                 registry["limits"] = {**(registry.get("limits") or {}), **changes}
@@ -663,7 +709,7 @@ class ColabPool:
         anything is allocated.
         """
         name = validate_session_name(name)
-        with self.hold():
+        with self.hold(f"new {name}"):
             existing = self.store.load()["sessions"].get(name)
             if existing is not None:
                 if not if_missing:
@@ -987,19 +1033,57 @@ class ColabPool:
                 f"'colab {subcommand}' is not a per-session command; use the "
                 "matching 'pool' command instead."
             )
-        with self.hold():
+        name = validate_session_name(name)
+        label = f"{subcommand} {name}"
+        found: list[PoolSession] = []
+
+        def owner_is_active() -> bool:
+            # Evaluated in the lock queue, so no switch can interleave.
             session = self.get(name)
             self._require_account(session.account)
-            self._activate(session.account)
+            found.append(session)
+            return self._is_active(session.account)
+
+        with self._access(owner_is_active, label) as mode:
+            session = found[-1] if found else self.get(name)
+            if mode == "exclusive":
+                self._require_account(session.account)
+                self._activate(session.account)
             result = self._colab(
                 session.config, [subcommand, "-s", session.name, *args]
             )
-            if result.returncode != 0:
-                self._handle_pruned_session(session)
-            return result.returncode
+        if result.returncode != 0:
+            # Cleanup may change the registry, so it runs as a separate,
+            # exclusive step and re-checks that the registration is unchanged.
+            with self.hold(f"{label} (cleanup)"):
+                entry = self.store.load()["sessions"].get(name)
+                if (
+                    entry is not None
+                    and entry["account"] == session.account
+                    and entry["config"] == session.config
+                ):
+                    self._handle_pruned_session(session)
+        return result.returncode
+
+    def _is_active(self, account: str) -> bool:
+        """Whether ``account`` is active and needs no switch or repair.
+
+        The caller holds the lock queue. Anything short of a clean match
+        returns False so the exclusive path (``_activate``) handles or
+        reports it.
+        """
+        if self.manager.config.load()["active_profile"] != account:
+            return False
+        current = self.manager.credentials.read_colab()
+        saved = self.manager.credentials.read_profile(account)
+        return (
+            current is not None
+            and saved is not None
+            and shares_refresh_token(current, saved)
+        )
 
     def stop(self, name: str, *, forget: bool = False) -> int:
-        with self.hold():
+        with self.hold(f"stop {name}"):
             session = self.get(name)
             if forget:
                 self._deregister(session.name)
@@ -1041,7 +1125,7 @@ class ColabPool:
     ) -> PoolSession:
         name = validate_session_name(name)
         path = Path(config).expanduser().resolve()
-        with self.hold():
+        with self.hold(f"adopt {name}"):
             account = self._require_account(account)
             existing = self.store.load()["sessions"].get(name)
             if existing is not None:
@@ -1199,7 +1283,7 @@ class ColabPool:
     def reconcile(
         self, *, all_accounts: bool = False, refresh: bool = True
     ) -> ReconcileReport:
-        with self.hold():
+        with self.hold("reconcile"):
             sessions = self.sessions()
             profiles = self._profiles()
             accounts = {session.account for session in sessions}
@@ -1254,7 +1338,7 @@ class ColabPool:
         touched; accounts that cannot be probed are reported under ``errors``.
         """
         report = PruneStateReport()
-        with self.hold():
+        with self.hold("prune-state"):
             if not self.state_dir.is_dir():
                 return report
             registered = {
@@ -1310,7 +1394,7 @@ class ColabPool:
         """
         if not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", endpoint):
             raise PoolError(f"Invalid endpoint {endpoint!r}.")
-        with self.hold():
+        with self.hold(f"reap {endpoint}"):
             account = self._require_account(account)
             for session in self.sessions():
                 if session.endpoint == endpoint:
@@ -1355,7 +1439,7 @@ class ColabPool:
         stopped_sessions: list[PoolSession] = []
         reaped_orphans: list[ServerSession] = []
         errors: dict[str, str] = {}
-        with self.hold():
+        with self.hold("stop-all"):
             for _ in range(max_passes):
                 report = self.reconcile(all_accounts=True, refresh=False)
                 registered = self.sessions()
@@ -1394,7 +1478,7 @@ class ColabPool:
     def snapshot(self, *, refresh: bool = True) -> Snapshot:
         errors: dict[str, str] = {}
         if refresh:
-            with self.hold():
+            with self.hold("list"):
                 errors = self.refresh_usage()
         registry = self.store.load()
         config = self.manager.config.load()

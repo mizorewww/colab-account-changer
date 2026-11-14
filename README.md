@@ -118,6 +118,9 @@ colab-pool limits --max-sessions 16 --max-per-account 6
 - 对已确认消失但仍保留的旧登记，运行 `colab-pool stop NAME` 清理；即使 `colab stop` 失败，只要服务端确认 endpoint 已不存在，也会注销登记。
 - 注销已确认消失的会话（自动清理、`stop`、`stop-all`）时，资源池同时删除该账号 state 文件中的同名 Colab 记录，名称可直接复用。`stop --forget` 不联系 Colab，会保留记录；之后 `new` 同名时先向服务端核实：已消失则清掉旧记录后创建，仍存在则拒绝并提示 `adopt`/`reap`，无法核实则拒绝。`colab-pool prune-state` 报告所有账号中这类残留记录，`--yes` 才删除，仍在服务端的记录永不删除。
 - `colab new` 失败但 VM 已分配（state 文件中已有 endpoint）时，资源池会立即尝试释放并向服务端确认；释放或确认失败则把它登记下来并在错误信息中说明，可用 `colab-pool stop NAME` 释放，不会留下孤儿。`colab new` 返回 0 却没有写入记录时同样报错，并提示先用 `reconcile` 查找可能的孤儿。
+- 账号锁按读写锁工作：目标账号已是当前账号时，`exec`/`upload`/`download`/`ls`/`status` 等按名称执行的命令共享锁、可并发；需要切换账号的命令以及 `new`/`stop`/`reap`/`reconcile`/`list`/`stop-all` 独占锁，并且排队等待的独占者优先于后来的共享者，不会被饿死。`colab-pool status`（不带名称）在不等锁的情况下显示当前持锁者；单条命令持锁超过 120 秒（`--lock-warn-after` / `COLAB_POOL_LOCK_WARN_AFTER`，0 关闭）时在 stderr 提示一次，不会终止命令。
+- 等锁超时（退出码 75）只表示资源池正忙，错误信息会列出持锁者、持有时长与子命令/会话名；**这不等于会话丢失，不要因此重建机器**，稍后重试即可。
+- 不要用 `colab-pool upload`/`download` 传大文件：传输期间一直持锁，会阻塞所有需要切换账号的命令。大文件请走 Google Drive（`drivemount`）或在 VM 内直接下载。
 - 不要混用原始 `colab` 与 `colab-pool` 操作同一个会话；原始命令不持有资源池的账号锁。
 
 ## 注意

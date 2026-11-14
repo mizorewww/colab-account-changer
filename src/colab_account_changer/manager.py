@@ -6,16 +6,18 @@ import copy
 import json
 import os
 import re
+import secrets
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from filelock import FileLock, Timeout
+from filelock import FileLock, ReadWriteLock, Timeout
 
 from colab_account_changer.errors import (
     AccountChangerError,
@@ -27,6 +29,7 @@ from colab_account_changer.storage import (
     ConfigStore,
     CredentialStore,
     validate_profile_name,
+    write_private_json,
 )
 from colab_account_changer.tokens import (
     inspect_token,
@@ -34,6 +37,20 @@ from colab_account_changer.tokens import (
     token_fingerprint,
 )
 from colab_account_changer.usage import Usage, UsageService
+
+HOLDERS_DIRECTORY = "lock-holders"
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -89,37 +106,206 @@ class AccountManager:
             lambda: Path.home() / ".config" / "colab-cli" / "token.json"
         )
         self._file_lock: FileLock | None = None
+        self._rw_lock: ReadWriteLock | None = None
+        self._mode: str | None = None
+        self._holder_started: str | None = None
 
     @property
     def lock_path(self) -> Path:
         return self.config.path.with_suffix(".lock")
 
-    @contextmanager
-    def exclusive(self, timeout: float = 10.0, message: str | None = None):
-        """Hold the account lock; re-entrant within this manager and thread.
+    @property
+    def lock_mode(self) -> str | None:
+        """``"shared"``/``"exclusive"`` while this manager holds the lock."""
+        return self._mode
 
-        Callers (such as the resource pool) may hold it across several account
-        operations and subprocesses; nested manager calls reuse the same lock
-        instead of deadlocking on a second file descriptor.
-        """
+    @property
+    def rw_lock_path(self) -> Path:
+        return self.config.path.with_suffix(".rwlock")
+
+    @property
+    def holders_path(self) -> Path:
+        return self.config.path.parent / HOLDERS_DIRECTORY
+
+    def _ensure_locks(self) -> None:
         self.config.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self._file_lock is None:
             self._file_lock = FileLock(self.lock_path)
+        if self._rw_lock is None:
+            self._rw_lock = ReadWriteLock(self.rw_lock_path, is_singleton=False)
+
+    @contextmanager
+    def exclusive(
+        self,
+        timeout: float = 10.0,
+        message: str | None = None,
+        label: str | None = None,
+    ):
+        """Hold the account lock exclusively; re-entrant within this manager.
+
+        Callers (such as the resource pool) may hold it across several account
+        operations and subprocesses; nested manager calls reuse the same lock
+        instead of deadlocking on a second file descriptor. See ``access`` for
+        how shared holders and the writer-first queue work.
+        """
+        with self.access(timeout=timeout, message=message, label=label):
+            yield
+
+    @contextmanager
+    def access(
+        self,
+        can_share: Callable[[], bool] | None = None,
+        *,
+        timeout: float = 10.0,
+        message: str | None = None,
+        label: str | None = None,
+    ):
+        """Hold the account lock, shared when ``can_share()`` allows it.
+
+        Two locks cooperate:
+
+        - ``config.lock`` (a ``FileLock``) is the queue: every exclusive holder
+          keeps it for its whole operation, and every caller passes through it.
+        - ``config.rwlock`` (a filelock ``ReadWriteLock``) separates shared
+          holders, which may run concurrently, from an exclusive holder.
+
+        A caller takes the queue lock, then evaluates ``can_share`` (which may
+        read the configuration safely). Shared callers take the read lock and
+        leave the queue at once. Exclusive callers keep the queue lock while
+        they wait for the write lock, so later callers line up behind them:
+        a waiting writer cannot be starved by a stream of shared holders.
+
+        Yields ``"shared"`` or ``"exclusive"``. Nested calls inside an
+        exclusive hold yield ``"exclusive"`` without locking again.
+        """
+        if self._mode == "shared":
+            raise RuntimeError("The account lock is held shared; release it first.")
+        if self._mode == "exclusive":
+            yield "exclusive"
+            return
+        self._ensure_locks()
+        assert self._file_lock is not None and self._rw_lock is not None
+        deadline = time.monotonic() + timeout
         try:
             self._file_lock.acquire(timeout=timeout)
         except Timeout as exc:
-            raise LockTimeoutError(
-                message
-                or "Another account operation is still running. Try again later."
-            ) from exc
+            raise self._busy(timeout, message) from exc
+        queued = True
+        holder: Path | None = None
         try:
-            yield
+            shared = can_share is not None and can_share()
+            mode = "shared" if shared else "exclusive"
+            holder = self._write_holder(mode, label, waiting=not shared)
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                if shared:
+                    self._rw_lock.acquire_read(timeout=remaining)
+                else:
+                    self._rw_lock.acquire_write(timeout=remaining)
+            except Timeout as exc:
+                raise self._busy(timeout, message) from exc
+            try:
+                if shared:
+                    self._file_lock.release()
+                    queued = False
+                else:
+                    self._write_holder(mode, label, waiting=False, path=holder)
+                self._mode = mode
+                yield mode
+            finally:
+                self._mode = None
+                self._rw_lock.release()
         finally:
-            self._file_lock.release()
+            if holder is not None:
+                holder.unlink(missing_ok=True)
+            if queued:
+                self._file_lock.release()
+
+    def _write_holder(
+        self,
+        mode: str,
+        label: str | None,
+        *,
+        waiting: bool,
+        path: Path | None = None,
+    ) -> Path:
+        """Describe this holder in a side file (never any secret)."""
+        if path is None:
+            path = self.holders_path / f"{os.getpid()}-{secrets.token_hex(4)}.json"
+            self._holder_started = self._now()
+        # Diagnostics only; never fail an operation over them.
+        with suppress(AccountChangerError):
+            write_private_json(
+                path,
+                {
+                    "pid": os.getpid(),
+                    "mode": mode,
+                    "waiting": waiting,
+                    "label": label or "account operation",
+                    "started_at": self._holder_started,
+                },
+                manage_parent_permissions=True,
+            )
+        return path
+
+    def lock_holders(self) -> list[dict[str, Any]]:
+        """Live holders (and queued exclusive waiters) of the account lock."""
+        holders = []
+        for path in sorted(self.holders_path.glob("*.json")):
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+                pid = int(value["pid"])
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            if not _process_alive(pid):
+                path.unlink(missing_ok=True)
+                continue
+            try:
+                started = datetime.fromisoformat(value["started_at"])
+                seconds = max(0.0, (datetime.now(UTC) - started).total_seconds())
+            except (KeyError, TypeError, ValueError):
+                seconds = None
+            holders.append(
+                {
+                    "pid": pid,
+                    "mode": str(value.get("mode")),
+                    "waiting": bool(value.get("waiting")),
+                    "label": str(value.get("label")),
+                    "started_at": value.get("started_at"),
+                    "held_seconds": seconds,
+                }
+            )
+        return holders
+
+    def describe_holders(self) -> str:
+        holders = [
+            holder for holder in self.lock_holders() if holder["pid"] != os.getpid()
+        ]
+        if not holders:
+            return "The current holder is unknown (no holder information)."
+        parts = []
+        for holder in holders:
+            state = (
+                "waiting for shared holders to finish"
+                if holder["waiting"]
+                else f"held {holder['mode']}"
+            )
+            seconds = holder["held_seconds"]
+            age = "" if seconds is None else f" for {seconds:.0f}s"
+            parts.append(f"pid {holder['pid']} '{holder['label']}' ({state}{age})")
+        return "Current lock holders: " + "; ".join(parts) + "."
+
+    def _busy(self, timeout: float, message: str | None) -> LockTimeoutError:
+        return LockTimeoutError(
+            f"{message or 'Another account operation is still running.'} "
+            f"The pool is busy: no lock within {timeout:g}s. "
+            f"{self.describe_holders()} This does not mean any Colab session "
+            "was lost; do not recreate sessions. Retry later (exit code 75)."
+        )
 
     @contextmanager
-    def _locked(self):
-        with self.exclusive():
+    def _locked(self, label: str | None = None):
+        with self.exclusive(label=label):
             yield
 
     @staticmethod
@@ -161,7 +347,7 @@ class AccountManager:
         self, *, verify: bool = True, include_gcloud: bool = True
     ) -> DiscoveryResult:
         """Import existing keyring/legacy tokens without changing Colab's login."""
-        with self._locked():
+        with self._locked("colab-account discover"):
             discovered: list[Profile] = []
             imported: list[Profile] = []
             errors: list[str] = []
@@ -373,7 +559,7 @@ class AccountManager:
 
     def usage(self, name: str | None = None) -> Usage:
         """Fetch and cache usage without modifying the active credential."""
-        with self._locked():
+        with self._locked("colab-account usage"):
             config = self.config.load()
             name = name or config["active_profile"]
             if name is None:
@@ -406,7 +592,7 @@ class AccountManager:
         verify: bool = True,
         force: bool = False,
     ) -> Profile:
-        with self._locked():
+        with self._locked("colab-account save"):
             return self._save_unlocked(name, email=email, verify=verify, force=force)
 
     def _save_unlocked(
@@ -498,7 +684,7 @@ class AccountManager:
         verify: bool = True,
     ) -> Profile:
         name = self._name(name)
-        with self._locked():
+        with self._locked("colab-account use"):
             config = self.config.load()
             if name not in config["profiles"]:
                 raise AccountError(f"Profile {name!r} does not exist.")
@@ -583,7 +769,7 @@ class AccountManager:
     def add(self, name: str, *, verify: bool = True) -> Profile:
         """Authenticate a new account, restoring the old one on every failure."""
         name = self._name(name)
-        with self._locked():
+        with self._locked("colab-account add"):
             config = self.config.load()
             if name in config["profiles"]:
                 raise AccountError(f"Profile {name!r} already exists.")
@@ -661,7 +847,7 @@ class AccountManager:
 
     def remove(self, name: str) -> Profile:
         name = self._name(name)
-        with self._locked():
+        with self._locked("colab-account remove"):
             config = self.config.load()
             if name not in config["profiles"]:
                 raise AccountError(f"Profile {name!r} does not exist.")

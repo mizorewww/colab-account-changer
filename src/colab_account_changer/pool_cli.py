@@ -16,6 +16,7 @@ from rich.text import Text
 
 from colab_account_changer.pool import (
     DEFAULT_LOCK_TIMEOUT,
+    DEFAULT_LOCK_WARN_AFTER,
     SESSION_COMMANDS,
     ColabPool,
     snapshot_json,
@@ -86,12 +87,22 @@ def pool_root(
             help="Seconds to wait for the account lock (exit code 75 on timeout).",
         ),
     ] = DEFAULT_LOCK_TIMEOUT,
+    lock_warn_after: Annotated[
+        float,
+        typer.Option(
+            "--lock-warn-after",
+            envvar="COLAB_POOL_LOCK_WARN_AFTER",
+            min=0,
+            help="Warn once on stderr after holding the lock this long (0: never).",
+        ),
+    ] = DEFAULT_LOCK_WARN_AFTER,
 ) -> None:
     """Use Colab sessions by name; accounts are chosen and switched for you."""
     ctx.obj = ColabPool(
         colab_command=colab_command,
         verify=not offline,
         lock_timeout=lock_timeout,
+        lock_warn_after=lock_warn_after,
         notify=_notify,
     )
 
@@ -226,6 +237,27 @@ def stop_all_instances(
     raise typer.Exit(1)
 
 
+def _print_holders(
+    holders: list[dict], *, title: str, out: Console = error_console
+) -> None:
+    if not holders:
+        return
+    table = Table(title=title, box=box.ROUNDED, header_style="bold cyan")
+    table.add_column("PID", justify="right")
+    table.add_column("Command", overflow="fold")
+    table.add_column("Mode")
+    table.add_column("Held", justify="right")
+    for holder in holders:
+        seconds = holder["held_seconds"]
+        table.add_row(
+            Text(str(holder["pid"])),
+            Text(holder["label"]),
+            Text("waiting (exclusive)" if holder["waiting"] else holder["mode"]),
+            Text("—" if seconds is None else f"{seconds:.0f}s"),
+        )
+    out.print(table)
+
+
 def _usage_cell(value: float | None) -> Text:
     return Text("—" if value is None else f"{value:.2f}")
 
@@ -236,15 +268,18 @@ def list_pool(
 ):
     """Show account balances and live server instances across all accounts."""
     pool = _pool(ctx)
+    # Seen before waiting: once this command holds the lock, others cannot.
+    holders = pool.lock_holders()
     if as_json:
-        with pool.hold():
+        with pool.hold("list"):
             server_report = pool.reconcile(all_accounts=True, refresh=False)
             snapshot = pool.snapshot(refresh=not cached)
-        _print_json(snapshot_json(snapshot, server_report))
+        _print_json(dict(snapshot_json(snapshot, server_report), lock_holders=holders))
         if server_report.errors:
             raise typer.Exit(1)
         return
-    with console.status("Loading pool overview…", spinner="dots"), pool.hold():
+    _print_holders(holders, title="Lock holders when this command started")
+    with console.status("Loading pool overview…", spinner="dots"), pool.hold("list"):
         server_report = pool.reconcile(all_accounts=True, refresh=False)
         snapshot = pool.snapshot(refresh=not cached)
     accounts = Table(title="Pool accounts", box=box.ROUNDED, header_style="bold cyan")
@@ -635,8 +670,35 @@ def _passthrough(subcommand: str):
 
 
 for _subcommand in SESSION_COMMANDS:
+    if _subcommand == "status":
+        continue
     pool_app.command(_subcommand, context_settings=PASSTHROUGH_SETTINGS)(
         _passthrough(_subcommand)
+    )
+
+
+@pool_app.command("status", context_settings=PASSTHROUGH_SETTINGS)
+def status(
+    ctx: typer.Context,
+    name: Annotated[
+        str | None, typer.Argument(help="Pooled session name (omit for the lock).")
+    ] = None,
+    args: ExtraArguments = None,
+) -> None:
+    """Run [cyan]colab status -s NAME[/cyan]; without NAME, show lock holders.
+
+    Showing the lock holders never waits for the lock.
+    """
+    pool = _pool(ctx)
+    if name is not None:
+        raise typer.Exit(pool.run("status", name, args or []))
+    holders = pool.lock_holders()
+    if not holders:
+        console.print("[green]The pool lock is free.[/green]")
+        return
+    _print_holders(holders, title="Pool lock holders", out=console)
+    console.print(
+        "[dim]Commands waiting behind these holders are queued, not lost.[/dim]"
     )
 
 
