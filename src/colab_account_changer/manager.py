@@ -507,7 +507,6 @@ class AccountManager:
         config = self.config.load()
         existing = config["profiles"].get(name)
         previous_raw = self.credentials.read_profile(name) if existing else None
-        self.credentials.write_profile(name, raw)
         updated = copy.deepcopy(config)
         now = self._now()
         updated["profiles"][name] = {
@@ -521,11 +520,7 @@ class AccountManager:
             updated["profiles"][name]["usage"] = copy.deepcopy(existing["usage"])
         if is_active:
             updated["active_profile"] = name
-        try:
-            self.config.save(updated)
-        except BaseException:
-            self._restore_profile(name, previous_raw, existed=existing is not None)
-            raise
+        self._commit_profile(name, raw, updated, previous_raw, existing is not None)
         return self._profile(
             name,
             updated["profiles"][name],
@@ -686,7 +681,6 @@ class AccountManager:
             )
 
         now = self._now()
-        self.credentials.write_profile(name, inspected.token_json)
         updated = copy.deepcopy(config)
         updated["profiles"][name] = {
             "email": resolved_email,
@@ -697,11 +691,9 @@ class AccountManager:
         if existing and not force and existing.get("usage"):
             updated["profiles"][name]["usage"] = copy.deepcopy(existing["usage"])
         updated["active_profile"] = name
-        try:
-            self.config.save(updated)
-        except BaseException:
-            self._restore_profile(name, previous_raw, existed=existing is not None)
-            raise
+        self._commit_profile(
+            name, inspected.token_json, updated, previous_raw, existing is not None
+        )
         return self._profile(
             name,
             updated["profiles"][name],
@@ -794,15 +786,20 @@ class AccountManager:
 
     def _save_refreshed_target(self, name: str, token_json: str) -> None:
         previous = self.credentials.read_profile(name)
-        config = self.config.load()
-        self.credentials.write_profile(name, token_json)
-        updated = copy.deepcopy(config)
+        updated = self.config.load()
         updated["profiles"][name]["token_sha256"] = token_fingerprint(token_json)
         updated["profiles"][name]["updated_at"] = self._now()
+        self._commit_profile(name, token_json, updated, previous, previous is not None)
+
+    def _commit_profile(
+        self, name: str, raw: str, updated: dict, previous: str | None, existed: bool
+    ) -> None:
+        """Store ``raw`` and save ``updated``, undoing the store if saving fails."""
+        self.credentials.write_profile(name, raw)
         try:
             self.config.save(updated)
         except BaseException:
-            self._restore_profile(name, previous, existed=previous is not None)
+            self._restore_profile(name, previous, existed=existed)
             raise
 
     def add(self, name: str | None = None, *, verify: bool = True) -> Profile:
