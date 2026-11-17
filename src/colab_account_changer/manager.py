@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -51,6 +52,36 @@ def _process_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+CLIPBOARD_COMMANDS = (
+    ["pbcopy"],
+    ["wl-copy"],
+    ["xclip", "-selection", "clipboard"],
+    ["clip"],
+)
+
+
+def copy_to_clipboard(text: str) -> bool:
+    for command in CLIPBOARD_COMMANDS:
+        with suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(command, input=text, text=True, check=True, timeout=5)
+            return True
+    return False
+
+
+def run_login(command: list[str], **options: Any) -> subprocess.CompletedProcess:
+    """Run Colab's sign-in, copying its authorization link to the clipboard."""
+    with subprocess.Popen(
+        command, stderr=subprocess.PIPE, text=True, **options
+    ) as process:
+        assert process.stderr is not None
+        for line in process.stderr:
+            sys.stderr.write(line)
+            link = re.search(r"https://\S+", line)
+            if link and copy_to_clipboard(link[0]):
+                sys.stderr.write("(Sign-in link copied to the clipboard.)\n")
+    return subprocess.CompletedProcess(command, process.returncode)
 
 
 @dataclass(frozen=True)
@@ -98,7 +129,7 @@ class AccountManager:
     ) -> None:
         self.config = config_store or ConfigStore()
         self.credentials = credentials or CredentialStore()
-        self.runner = runner or subprocess.run
+        self.runner = runner or run_login
         self.gcloud_runner = gcloud_runner or subprocess.run
         self.usage_service = usage_service or UsageService()
         self.colab_command = colab_command
@@ -816,7 +847,6 @@ class AccountManager:
                             runner_options["env"] = environment
                         result = self.runner(
                             [self.colab_command, "--auth=oauth2", "whoami"],
-                            check=False,
                             **runner_options,
                         )
                 except FileNotFoundError as exc:

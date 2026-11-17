@@ -373,7 +373,8 @@ def add(
     console.print(
         Panel(
             "The current profile is saved first. Colab CLI will then ask you to\n"
-            "authorize the new account. Failure or Ctrl-C restores the old account.",
+            "authorize the new account (the sign-in link is copied to the\n"
+            "clipboard). Failure or Ctrl-C restores the old account.",
             title=f"Add {escape(name or 'account')}",
             border_style="cyan",
         )

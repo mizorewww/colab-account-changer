@@ -1,10 +1,12 @@
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 from conftest import make_token, refreshed_token
 
 from colab_account_changer.errors import AccountError, ConfigError, TokenError
+from colab_account_changer.manager import run_login
 from colab_account_changer.storage import COLAB_SERVICE, COLAB_USERNAME
 from colab_account_changer.tokens import Identity, InspectedToken
 
@@ -230,7 +232,7 @@ def test_add_authenticates_in_an_empty_slot_and_keeps_new_account_active(
 ):
     manager.save("personal", verify=False)
 
-    def authenticate(command, check):
+    def authenticate(command):
         assert command[:2] == ["colab", "--auth=oauth2"]
         assert credentials.read_colab() is None
         credentials.write_colab(make_token("work"))
@@ -279,7 +281,7 @@ def test_add_refuses_untracked_current_account(manager, credentials):
 def test_add_restores_account_when_new_token_is_invalid(manager, credentials, mocker):
     manager.save("personal", verify=False)
 
-    def authenticate(command, check):
+    def authenticate(command):
         credentials.write_colab(make_token("work"))
         return subprocess.CompletedProcess(command, 0)
 
@@ -298,7 +300,7 @@ def test_add_restores_account_when_new_token_is_invalid(manager, credentials, mo
 def test_add_without_original_cleans_up_failed_new_login(manager, credentials):
     credentials.delete_colab()
 
-    def authenticate(command, check):
+    def authenticate(command):
         credentials.write_colab(make_token("work"))
         return subprocess.CompletedProcess(command, 0)
 
@@ -322,7 +324,7 @@ def test_add_isolates_legacy_token_from_new_colab_authentication(
     credentials.legacy_path = legacy
     isolated_homes = []
 
-    def authenticate(command, check, env):
+    def authenticate(command, env):
         isolated_home = Path(env["HOME"])
         isolated_homes.append(isolated_home)
         assert isolated_home != Path.home()
@@ -385,7 +387,7 @@ def test_status_detects_unsaved_current_credential(manager, credentials):
 def test_add_without_name_uses_email_alias(manager, credentials, mocker):
     manager.save("personal", verify=False)
 
-    def authenticate(command, check):
+    def authenticate(command):
         credentials.write_colab(make_token("work"))
         return subprocess.CompletedProcess(command, 0)
 
@@ -401,3 +403,17 @@ def test_add_without_name_uses_email_alias(manager, credentials, mocker):
 
     assert profile.name == "alice.w"
     assert credentials.read_profile("alice.w") == make_token("work")
+
+
+def test_run_login_copies_the_sign_in_link(mocker, capsys):
+    copy = mocker.patch(
+        "colab_account_changer.manager.copy_to_clipboard", return_value=True
+    )
+    link = "https://accounts.example/auth?x=1"
+    script = f"import sys; print('Visit:\\n  {link}', file=sys.stderr)"
+
+    result = run_login([sys.executable, "-c", script])
+
+    assert result.returncode == 0
+    copy.assert_called_once_with(link)
+    assert "copied to the clipboard" in capsys.readouterr().err

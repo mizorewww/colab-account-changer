@@ -211,7 +211,7 @@ def test_use_forwards_safety_options(cli_manager, mocker):
 
 
 def test_add_preserves_interactive_colab_authentication(cli_manager):
-    def authenticate(command, check):
+    def authenticate(command):
         cli_manager.credentials.write_colab(make_token("work"))
         return subprocess.CompletedProcess(command, 0)
 
@@ -224,7 +224,7 @@ def test_add_preserves_interactive_colab_authentication(cli_manager):
     assert "work" in result.stdout
     command = cli_manager.runner.call_args.args[0]
     assert command == ["colab", "--auth=oauth2", "whoami"]
-    assert cli_manager.runner.call_args.kwargs == {"check": False}
+    assert cli_manager.runner.call_args.kwargs == {}
 
 
 def test_remove_requires_confirmation(cli_manager, credentials):
