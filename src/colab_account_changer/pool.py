@@ -4,12 +4,13 @@ Colab CLI keeps one OAuth credential per machine, and a session is visible only
 to the account that created it. When a command runs under another account,
 Colab CLI prunes the "invisible" session record. The pool therefore records the
 owning account of every session, keeps one Colab session-state file per account,
-and runs every Colab command under the account lock after switching to the
-owning account.
+and starts every Colab command under the account lock after switching to the
+owning account. Commands that need the account only while loading the session
+(see ``DETACHABLE_COMMANDS``) release the lock once started.
 
 The pool never reads, prints, or stores OAuth or runtime-proxy tokens. Colab
 CLI's own session-state files contain proxy tokens; the pool only extracts the
-non-secret ``endpoint`` field from them.
+non-secret ``endpoint`` and ``token_expires_at`` fields from them.
 """
 
 from __future__ import annotations
@@ -27,9 +28,9 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,20 @@ SESSION_COMMANDS = (
     "restart-kernel",
     "ssh",
 )
+# Colab CLI commands that use the active account only while loading the session:
+# ``State.get_session`` calls ``list_assignments`` (and, under the wrong
+# account, prunes the record) only when the runtime-proxy token expires within
+# 5 minutes. Afterwards they talk to the runtime proxy with that token alone.
+# ``ssh --rm`` stops the session at the end, so it keeps the lock.
+DETACHABLE_COMMANDS = frozenset(
+    {"exec", "repl", "upload", "download", "ls", "rm", "edit", "restart-kernel", "ssh"}
+)
+# A detached command starts only with a token this far from expiry, well above
+# Colab CLI's own 5-minute refresh margin; otherwise the pool refreshes first.
+DETACH_TOKEN_MARGIN = timedelta(minutes=15)
+# The lock is kept this long after the start, so Colab CLI loads the session
+# before another command can switch accounts or stop the session.
+DETACH_GRACE = 3.0
 SESSION_LINE_RE = re.compile(
     r"^\[(?P<name>[^\]]*)\] (?P<endpoint>\S+) \| Hardware: (?P<hardware>[^|]+?) \|"
 )
@@ -498,6 +513,23 @@ class ColabPool:
         """Read only the non-secret endpoint of ``name`` from a Colab state file."""
         return ColabPool.read_records(config).get(name)
 
+    @staticmethod
+    def token_expires_at(config: str | Path, name: str) -> datetime | None:
+        """Read only the non-secret proxy-token expiry of ``name``."""
+        try:
+            records = json.loads(Path(config).read_text(encoding="utf-8"))
+            value = records[name]["token_expires_at"]
+            expires = datetime.fromisoformat(value)
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+        return expires if expires.tzinfo else expires.replace(tzinfo=UTC)
+
+    def _token_fresh(self, session: PoolSession) -> bool:
+        expires = self.token_expires_at(session.config, session.name)
+        return expires is not None and expires - datetime.now(UTC) > (
+            DETACH_TOKEN_MARGIN
+        )
+
     @classmethod
     def _session(cls, name: str, entry: dict[str, Any]) -> PoolSession:
         return PoolSession(
@@ -556,7 +588,27 @@ class ColabPool:
         return found
 
     def _drop_record(self, config: str | Path, name: str, endpoint: str) -> bool:
-        """Delete ``name`` from a Colab state file if it still points at ``endpoint``.
+        """Delete ``name`` from a Colab state file if it points at ``endpoint``."""
+        return self._change_record(
+            config, name, endpoint, lambda records: records.pop(name)
+        )
+
+    def _expire_token(self, config: str | Path, name: str, endpoint: str) -> bool:
+        """Clear the token expiry of ``name`` so Colab CLI refreshes it next time."""
+
+        def expire(records: dict[str, Any]) -> None:
+            records[name] = {**records[name], "token_expires_at": None}
+
+        return self._change_record(config, name, endpoint, expire)
+
+    def _change_record(
+        self,
+        config: str | Path,
+        name: str,
+        endpoint: str,
+        change: Callable[[dict[str, Any]], None],
+    ) -> bool:
+        """Let ``change`` edit a Colab state file if ``name`` points at ``endpoint``.
 
         The write happens under Colab CLI's own state-file lock (``FILE.lock``,
         a filelock ``ReadWriteLock``) and replaces the file atomically. Records
@@ -579,7 +631,7 @@ class ColabPool:
                 record = records.get(name)
                 if not isinstance(record, dict) or record.get("endpoint") != endpoint:
                     return False
-                del records[name]
+                change(records)
                 write_private_json(path, records)
                 return True
         except Timeout as exc:
@@ -1226,6 +1278,49 @@ class ColabPool:
             "replacement is needed."
         )
 
+    def _can_detach(
+        self, subcommand: str, args: Sequence[str], session: PoolSession
+    ) -> bool:
+        """Whether the command may outlive the lock; the caller holds it.
+
+        True only for a ``DETACHABLE_COMMANDS`` command whose proxy token is
+        fresh, so Colab CLI never consults the (by then possibly switched)
+        account. A token near expiry is refreshed first under the owning
+        account: the pool clears only its expiry, which makes a quiet
+        ``colab ls`` fetch a new one. If that fails, the command keeps the
+        lock and reports the problem itself.
+        """
+        if subcommand not in DETACHABLE_COMMANDS:
+            return False
+        if subcommand == "ssh" and "--rm" in args:
+            return False
+        if self._token_fresh(session):
+            return True
+        if session.endpoint is None:
+            return False
+        try:
+            if not self._expire_token(session.config, session.name, session.endpoint):
+                return False
+        except AccountChangerError:
+            return False
+        refresh = self._colab(
+            session.config,
+            ["ls", "-s", session.name],
+            capture="both",
+            interactive=False,
+        )
+        return refresh.returncode == 0 and self._token_fresh(session)
+
+    def _spawn(self, config: Path | str, args: Sequence[str]) -> subprocess.Popen:
+        try:
+            return subprocess.Popen(
+                [self.colab_command, "--config", str(config), *args], text=True
+            )
+        except FileNotFoundError as exc:
+            raise PoolError(
+                f"Colab CLI executable {self.colab_command!r} was not found."
+            ) from exc
+
     def run(self, subcommand: str, name: str, args: Sequence[str] = ()) -> int:
         """Run ``colab <subcommand> -s NAME ...`` under the owning account.
 
@@ -1233,6 +1328,11 @@ class ColabPool:
         Colab exit code is returned (128 + N when killed by signal N). If Colab
         prunes the local record after a terminal error, a confirmed server-side
         loss is also removed from the pool registry.
+
+        Commands that need the account only at startup (``_can_detach``) hold
+        the lock for ``DETACH_GRACE`` seconds at most, so a long ``exec``,
+        ``download``, or ``ssh --proxy-mode`` tunnel does not block account
+        switches, ``stop``, or ``list``.
         """
         if subcommand in {"new", "stop", "sessions", "run"}:
             raise PoolError(
@@ -1246,16 +1346,30 @@ class ColabPool:
             # Evaluated in the lock queue, so no switch can interleave.
             return self._is_active(self._require_account(self.get(name).account))
 
-        with self._access(owner_is_active, label) as mode:
-            # Any lock mode keeps writers out, so the registration is stable.
-            session = self.get(name)
-            if mode == "exclusive":
-                self._require_account(session.account)
-                self._activate(session.account)
-            result = self._colab(
-                session.config, [subcommand, "-s", session.name, *args]
-            )
-        if result.returncode != 0:
+        process = None
+        try:
+            with self._access(owner_is_active, label) as mode:
+                # Any lock mode keeps writers out, so the registration is stable.
+                session = self.get(name)
+                if mode == "exclusive":
+                    self._require_account(session.account)
+                    self._activate(session.account)
+                command = [subcommand, "-s", session.name, *args]
+                if self._can_detach(subcommand, args, session):
+                    process = self._spawn(session.config, command)
+                    with suppress(subprocess.TimeoutExpired):
+                        process.wait(timeout=DETACH_GRACE)
+                else:
+                    returncode = self._colab(session.config, command).returncode
+            if process is not None:
+                returncode = process.wait()
+        except BaseException:
+            # Like subprocess.run: never leave the child running unattended.
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+            raise
+        if returncode != 0:
             # Cleanup may change the registry, so it runs as a separate,
             # exclusive step and re-checks that the registration is unchanged.
             with self.hold(f"{label} (cleanup)"):
@@ -1267,7 +1381,7 @@ class ColabPool:
                 ):
                     self._handle_pruned_session(session)
         # A child killed by signal N reports -N; shells expect 128 + N.
-        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+        return returncode if returncode >= 0 else 128 - returncode
 
     def _is_active(self, account: str) -> bool:
         """Whether ``account`` is active and needs no switch or repair.

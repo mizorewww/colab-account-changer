@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -944,8 +945,8 @@ def test_list_reports_partial_server_inspection_failure(env):
     assert set(snapshot["server_inspection"]["errors"]) == {"alpha", "beta"}
 
 
-def exec_calls(env):
-    calls = [call for call in env.calls() if call["subcommand"] == "exec"]
+def exec_calls(env, subcommand="exec"):
+    calls = [call for call in env.calls() if call["subcommand"] == subcommand]
     return sorted(calls, key=lambda call: call["start"])
 
 
@@ -982,12 +983,12 @@ def test_concurrent_commands_never_overlap_across_accounts(env):
 
     finish(
         *[
-            env.pool("exec", name, background=True, extra_env=delay)
+            env.pool("status", name, background=True, extra_env=delay)
             for name in ("node-a", "node-b", "node-a")
         ]
     )
 
-    calls = exec_calls(env)
+    calls = exec_calls(env, "status")
     assert len(calls) == 3
     for call in calls:
         assert call["account"] == {"node-a": "alpha", "node-b": "beta"}[call["name"]]
@@ -1002,11 +1003,11 @@ def test_same_account_commands_share_the_lock(env):
     delay = {"FAKE_COLAB_DELAY": "3"}
 
     finish(
-        env.pool("exec", "node-a", background=True, extra_env=delay),
-        env.pool("exec", "node-b", background=True, extra_env=delay),
+        env.pool("status", "node-a", background=True, extra_env=delay),
+        env.pool("status", "node-b", background=True, extra_env=delay),
     )
 
-    first, second = exec_calls(env)
+    first, second = exec_calls(env, "status")
     assert first["account"] == second["account"] == "alpha"
     assert second["start"] < first["end"]  # They ran concurrently.
     assert lock_holders(env) == []
@@ -1017,16 +1018,16 @@ def test_waiting_account_switch_is_not_starved_by_shared_holders(env):
     created(env, "node-a", "alpha")  # alpha is now the active account.
 
     reader = env.pool(
-        "exec", "node-a", background=True, extra_env={"FAKE_COLAB_DELAY": "3"}
+        "status", "node-a", background=True, extra_env={"FAKE_COLAB_DELAY": "3"}
     )
-    wait_for_holder(env, "exec node-a")
-    switcher = env.pool("exec", "node-b", background=True)
-    wait_for_holder(env, "exec node-b", waiting=True)
+    wait_for_holder(env, "status node-a")
+    switcher = env.pool("status", "node-b", background=True)
+    wait_for_holder(env, "status node-b", waiting=True)
     # Without writer preference this would join the running alpha command.
-    late_reader = env.pool("exec", "node-a", background=True)
+    late_reader = env.pool("status", "node-a", background=True)
     finish(reader, switcher, late_reader)
 
-    first, switch, late = exec_calls(env)
+    first, switch, late = exec_calls(env, "status")
     assert (first["account"], switch["account"], late["account"]) == (
         "alpha",
         "beta",
@@ -1040,9 +1041,9 @@ def test_waiting_account_switch_is_not_starved_by_shared_holders(env):
 def test_busy_pool_timeout_names_holder_and_says_nothing_is_lost(env):
     created(env, "node-a", "alpha")
     reader = env.pool(
-        "exec", "node-a", background=True, extra_env={"FAKE_COLAB_DELAY": "4"}
+        "status", "node-a", background=True, extra_env={"FAKE_COLAB_DELAY": "4"}
     )
-    holder = wait_for_holder(env, "exec node-a")
+    holder = wait_for_holder(env, "status node-a")
 
     assert set(holder) == {"pid", "mode", "waiting", "label", "started_at"}
     assert holder["mode"] == "shared"
@@ -1054,7 +1055,7 @@ def test_busy_pool_timeout_names_holder_and_says_nothing_is_lost(env):
 
     shown = env.pool("status")
     assert shown.returncode == 0, shown.stderr
-    assert "pool exec node-a" in shown.stdout
+    assert "pool status node-a" in shown.stdout
     assert "shared" in shown.stdout
 
     started = time.monotonic()
@@ -1065,7 +1066,7 @@ def test_busy_pool_timeout_names_holder_and_says_nothing_is_lost(env):
     assert timed_out.returncode == 75
     message = flat(timed_out.stderr)
     assert "The pool is busy" in message
-    assert "'pool exec node-a' (held shared for" in message
+    assert "'pool status node-a' (held shared for" in message
     assert "does not mean any Colab session was lost" in message
     assert "do not recreate sessions" in message
     assert "sessions" not in [call["subcommand"] for call in env.calls()[2:]]
@@ -1078,18 +1079,129 @@ def test_long_lock_hold_warns_once_without_killing_the_command(env):
     result = env.pool(
         "--lock-warn-after",
         "0.5",
-        "exec",
+        "status",
         "node-a",
         input="1",
         extra_env={"FAKE_COLAB_DELAY": "1.5"},
     )
 
     assert result.returncode == 0, result.stderr
-    assert "exec node-a on alpha" in result.stdout
+    assert "status node-a on alpha" in result.stdout
     message = flat(result.stderr)
     assert message.count("has held the pool lock") == 1
-    assert "'exec node-a' has held the pool lock (shared)" in message
+    assert "'status node-a' has held the pool lock (shared)" in message
     assert "Avoid moving large files through colab-pool" in message
+
+
+def wait_until_unlocked(env, label, process, timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if all(holder["label"] != f"pool {label}" for holder in lock_holders(env)):
+            assert process.poll() is None, "the command ended before releasing"
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"{label!r} still holds the lock")
+
+
+def set_token_expiry(env, account, name, expires):
+    path = env.config.parent / "pool-state" / f"{account}.json"
+    records = json.loads(path.read_text())
+    records[name]["token_expires_at"] = expires.isoformat()
+    path.write_text(json.dumps(records))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("exec", "node-a"),
+        ("download", "node-a", "/content/out.bin", "out.bin"),
+        ("ssh", "node-a", "--proxy-mode"),
+    ],
+)
+def test_long_session_command_releases_the_lock_after_startup(env, command):
+    # Issue #2: a tunnel or a wedged exec/download held the lock for hours.
+    created(env, "node-b", "beta")
+    created(env, "node-a", "alpha")
+    subcommand = command[0]
+    running = env.pool(*command, background=True, extra_env={"FAKE_COLAB_DELAY": "8"})
+    wait_for_holder(env, f"{subcommand} node-a")
+    wait_until_unlocked(env, f"{subcommand} node-a", running)
+
+    # Switching accounts, inspecting, and stopping no longer wait for it.
+    switched = env.pool("status", "node-b")
+    assert switched.returncode == 0, switched.stderr
+    assert "status node-b on beta" in switched.stdout
+    assert env.active() == "beta"
+    assert env.pool("reconcile", "--cached").returncode == 0
+    assert env.pool("stop", "node-b").returncode == 0
+    finish(running)
+
+    long_call = next(call for call in env.calls() if call["subcommand"] == subcommand)
+    assert long_call["account"] == "alpha"
+    later = [call for call in env.calls() if call["start"] > long_call["start"]]
+    assert later and all(call["end"] < long_call["end"] for call in later)
+    # The running session kept its record and registration.
+    assert "node-a" in env.records("alpha")
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
+    assert lock_holders(env) == []
+
+
+def test_near_expiry_token_is_refreshed_under_the_owner_before_detaching(env):
+    # Colab CLI refreshes a near-expiry proxy token with the *active* account
+    # and prunes the record when that account does not own the endpoint. The
+    # pool refreshes it under the lock, so a later switch cannot prune it.
+    created(env, "node-a", "alpha")
+    created(env, "node-b", "beta")
+    expiring = datetime.now(UTC) + timedelta(minutes=10)
+    set_token_expiry(env, "alpha", "node-a", expiring)
+
+    running = env.pool(
+        "exec", "node-a", background=True, extra_env={"FAKE_COLAB_DELAY": "8"}
+    )
+    wait_for_holder(env, "exec node-a")
+    wait_until_unlocked(env, "exec node-a", running)
+    switched = env.pool("status", "node-b")
+    assert switched.returncode == 0, switched.stderr
+    finish(running)
+
+    calls = [call for call in env.calls() if call["name"] == "node-a"][-2:]
+    assert [(call["subcommand"], call["account"]) for call in calls] == [
+        ("ls", "alpha"),
+        ("exec", "alpha"),
+    ]
+    refreshed = datetime.fromisoformat(
+        env.records("alpha")["node-a"]["token_expires_at"]
+    )
+    assert refreshed - datetime.now(UTC) > timedelta(minutes=30)
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
+
+
+def test_session_command_keeps_the_lock_when_the_token_cannot_be_refreshed(env):
+    created(env, "node-a", "alpha")
+    set_token_expiry(env, "alpha", "node-a", datetime.now(UTC))
+    server = env.server_state()
+    del server["alpha"]["ep-node-a-alpha"]
+    env.server.write_text(json.dumps(server))
+
+    result = env.pool("exec", "node-a", input="1")
+
+    assert result.returncode == 1
+    assert "Session 'node-a' not found" in result.stdout
+    assert "Session 'node-a' vanished" in flat(result.stderr)
+    assert env.registry()["sessions"] == {}
+
+
+@pytest.mark.parametrize(
+    "command", [("ssh", "node-a", "--proxy-mode", "--rm"), ("drivemount", "node-a")]
+)
+def test_commands_that_need_the_account_later_keep_the_lock(env, command):
+    created(env, "node-a", "alpha")
+    label = f"{command[0]} node-a"
+    running = env.pool(*command, background=True, extra_env={"FAKE_COLAB_DELAY": "5"})
+    wait_for_holder(env, label)
+    time.sleep(4)  # Past the startup grace of detached commands.
+    assert any(holder["label"] == f"pool {label}" for holder in lock_holders(env))
+    finish(running)
 
 
 def test_lock_timeout_is_reported_with_retry_exit_code(env):
