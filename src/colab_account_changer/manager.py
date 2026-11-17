@@ -864,8 +864,18 @@ class AccountManager:
                         "Colab authentication did not create an OAuth credential."
                     )
                 inspected = inspect_token(raw, verify=verify)
+                email = inspected.identity.email
+                for existing, metadata in config["profiles"].items():
+                    if (
+                        email
+                        and email.casefold() == (metadata["email"] or "").casefold()
+                    ):
+                        raise AccountError(
+                            f"{email} is already saved as profile {existing!r}; "
+                            "the previous account was restored."
+                        )
                 name = name or self._available_alias(
-                    inspected.identity.email or "account", config["profiles"]
+                    email or "account", config["profiles"]
                 )
                 self.credentials.write_profile(name, inspected.token_json)
                 created_profile = True

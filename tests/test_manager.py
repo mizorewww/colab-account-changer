@@ -417,3 +417,24 @@ def test_run_login_copies_the_sign_in_link(mocker, capsys):
     assert result.returncode == 0
     copy.assert_called_once_with(link)
     assert "copied to the clipboard" in capsys.readouterr().err
+
+
+def test_add_refuses_an_already_saved_email(manager, credentials, mocker):
+    manager.save("personal", email="alice@example.com", verify=False)
+
+    def authenticate(command):
+        credentials.write_colab(make_token("again"))
+        return subprocess.CompletedProcess(command, 0)
+
+    manager.runner.side_effect = authenticate
+    mocker.patch(
+        "colab_account_changer.manager.inspect_token",
+        side_effect=lambda raw, verify: InspectedToken(
+            raw, Identity(email="Alice@example.com")
+        ),
+    )
+
+    with pytest.raises(AccountError, match="already saved as profile 'personal'"):
+        manager.add()
+    assert credentials.read_colab() == make_token("personal")
+    assert list(manager.config.load()["profiles"]) == ["personal"]
