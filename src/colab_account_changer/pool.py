@@ -747,14 +747,10 @@ class ColabPool:
                 self.store.save(registry)
             return self.limits(registry)
 
-    def refresh_usage(self, accounts: Iterable[str] | None = None) -> dict[str, str]:
-        """Refresh usage, caching when possible. Returns per-account errors."""
-        _, errors = self._fetch_usage(accounts)
-        return errors
-
-    def _fetch_usage(
+    def refresh_usage(
         self, accounts: Iterable[str] | None = None
     ) -> tuple[dict[str, Usage], dict[str, str]]:
+        """Fetch usage (cached when possible); returns values and errors."""
         profiles = self._profiles()
         values: dict[str, Usage] = {}
         errors: dict[str, str] = {}
@@ -893,7 +889,7 @@ class ColabPool:
             else:
                 failed: dict[str, str] = {}
                 if refresh:
-                    failed = self.refresh_usage()
+                    failed = self.refresh_usage()[1]
                     for account_name, message in failed.items():
                         self.notify(f"Usage unavailable for {account_name}: {message}")
                 selection = self._select(failed)
@@ -1697,20 +1693,16 @@ class ColabPool:
         return report, self.snapshot(refresh=refresh)
 
     def snapshot(self, *, refresh: bool = True) -> Snapshot:
-        config = self.manager.config.load()
-        errors: dict[str, str] = {}
-        values: dict[str, Usage] = {}
-        fetched_at = None
-        if refresh:
-            values, errors = self._fetch_usage()
-            fetched_at = _now()
+        values, errors = self.refresh_usage() if refresh else ({}, {})
+        fetched_at = _now()
         registry = self.store.load()
+        config = self.manager.config.load()
         sessions = self.sessions()
         counts: dict[str, int] = {}
         for session in sessions:
             counts[session.account] = counts.get(session.account, 0) + 1
         accounts = []
-        for profile in self.manager.profiles(config=config):
+        for profile in self.manager.profiles():
             accounts.append(
                 AccountState(
                     name=profile.name,
