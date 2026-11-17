@@ -326,10 +326,6 @@ class StopAllResult:
     def success(self) -> bool:
         return self.final.consistent and not self.remaining_sessions
 
-    @property
-    def stopped_count(self) -> int:
-        return len(self.stopped_sessions) + len(self.reaped_orphans)
-
 
 @dataclass(frozen=True)
 class ImportResult:

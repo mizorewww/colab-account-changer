@@ -334,11 +334,6 @@ class AccountManager:
             "was lost; do not recreate sessions. Retry later (exit code 75)."
         )
 
-    @contextmanager
-    def _locked(self, label: str | None = None):
-        with self.exclusive(label=label):
-            yield
-
     @staticmethod
     def _name(name: str) -> str:
         try:
@@ -632,7 +627,7 @@ class AccountManager:
         verify: bool = True,
         force: bool = False,
     ) -> Profile:
-        with self._locked("colab-account save"):
+        with self.exclusive(label="colab-account save"):
             return self._save_unlocked(name, email=email, verify=verify, force=force)
 
     def _save_unlocked(
@@ -724,7 +719,7 @@ class AccountManager:
         verify: bool = True,
     ) -> Profile:
         name = self._name(name)
-        with self._locked("colab-account use"):
+        with self.exclusive(label="colab-account use"):
             config = self.config.load()
             if name not in config["profiles"]:
                 raise AccountError(f"Profile {name!r} does not exist.")
@@ -817,7 +812,7 @@ class AccountManager:
         Without a name, the alias is derived from the signed-in email.
         """
         name = name and self._name(name)
-        with self._locked("colab-account add"):
+        with self.exclusive(label="colab-account add"):
             config = self.config.load()
             if name in config["profiles"]:
                 raise AccountError(f"Profile {name!r} already exists.")
@@ -907,7 +902,7 @@ class AccountManager:
 
     def remove(self, name: str) -> Profile:
         name = self._name(name)
-        with self._locked("colab-account remove"):
+        with self.exclusive(label="colab-account remove"):
             config = self.config.load()
             if name not in config["profiles"]:
                 raise AccountError(f"Profile {name!r} does not exist.")
