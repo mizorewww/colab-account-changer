@@ -533,8 +533,8 @@ class AccountManager:
         except (OSError, subprocess.SubprocessError, ValueError, TypeError):
             return []
 
-    def profiles(self, *, config: dict[str, Any] | None = None) -> list[Profile]:
-        config = self.config.load() if config is None else config
+    def profiles(self) -> list[Profile]:
+        config = self.config.load()
         return [
             self._profile(
                 name,
@@ -576,8 +576,9 @@ class AccountManager:
         # A shared tunnel cannot upgrade its lock. Other readers can skip this
         # optional write instead of waiting behind a tunnel or queued writer.
         if self.lock_mode != "shared":
-            with suppress(LockTimeoutError), self.exclusive(
-                timeout=0, label="colab-account usage cache"
+            with (
+                suppress(LockTimeoutError),
+                self.exclusive(timeout=0, label="colab-account usage cache"),
             ):
                 updated = self.config.load()
                 metadata = updated["profiles"].get(name)

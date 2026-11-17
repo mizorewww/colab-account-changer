@@ -86,10 +86,11 @@ def _discover(
     include_gcloud: bool,
     best_effort: bool = False,
 ) -> DiscoveryResult:
-    options = {"timeout": 0.0} if best_effort else {}
     try:
         result = manager.discover(
-            verify=not offline, include_gcloud=include_gcloud, **options
+            verify=not offline,
+            include_gcloud=include_gcloud,
+            timeout=0.0 if best_effort else 10.0,
         )
     except LockTimeoutError:
         if not best_effort:
@@ -251,9 +252,7 @@ def list_accounts(
     discovery = (
         None
         if no_discover
-        else _discover(
-            manager, offline=offline, include_gcloud=True, best_effort=True
-        )
+        else _discover(manager, offline=offline, include_gcloud=True, best_effort=True)
     )
     _render_accounts(
         manager,

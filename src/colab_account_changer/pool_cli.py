@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from typing import Annotated
 
 import typer
@@ -19,8 +20,6 @@ from colab_account_changer.pool import (
     DEFAULT_LOCK_WARN_AFTER,
     SESSION_COMMANDS,
     ColabPool,
-    ReconcileReport,
-    Snapshot,
     snapshot_json,
     snapshot_usages,
 )
@@ -279,15 +278,6 @@ def _usage_cell(value: float | None) -> Text:
     return Text("—" if value is None else f"{value:.2f}")
 
 
-def _list_overview(
-    pool: ColabPool, *, cached: bool
-) -> tuple[ReconcileReport, Snapshot]:
-    report, snapshot = pool.overview(refresh=not cached)
-    if report.skipped_reason:
-        error_console.print(Text(report.skipped_reason), style="yellow")
-    return report, snapshot
-
-
 @pool_app.command("list")
 def list_pool(
     ctx: typer.Context, cached: CachedOption = False, as_json: JsonOption = False
@@ -296,15 +286,17 @@ def list_pool(
     pool = _pool(ctx)
     # Capture other holders before attempting server inspection.
     holders = pool.lock_holders()
+    if not as_json:
+        _print_holders(holders, title="Lock holders when this command started")
+    with nullcontext() if as_json else console.status("Loading pool overview…"):
+        server_report, snapshot = pool.overview(refresh=not cached)
+    if server_report.skipped_reason:
+        error_console.print(Text(server_report.skipped_reason), style="yellow")
     if as_json:
-        server_report, snapshot = _list_overview(pool, cached=cached)
         _print_json(dict(snapshot_json(snapshot, server_report), lock_holders=holders))
         if not server_report.complete:
             raise typer.Exit(1)
         return
-    _print_holders(holders, title="Lock holders when this command started")
-    with console.status("Loading pool overview…", spinner="dots"):
-        server_report, snapshot = _list_overview(pool, cached=cached)
     accounts = Table(title="Pool accounts", box=box.ROUNDED, header_style="bold cyan")
     accounts.add_column("", width=2)
     accounts.add_column("Alias", style="bold", overflow="fold")
