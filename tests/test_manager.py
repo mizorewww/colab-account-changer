@@ -6,6 +6,7 @@ from conftest import make_token, refreshed_token
 
 from colab_account_changer.errors import AccountError, ConfigError, TokenError
 from colab_account_changer.storage import COLAB_SERVICE, COLAB_USERNAME
+from colab_account_changer.tokens import Identity, InspectedToken
 
 
 def test_save_tracks_the_current_token_without_writing_secrets_to_config(
@@ -379,3 +380,24 @@ def test_status_detects_unsaved_current_credential(manager, credentials):
     assert status.active_profile is None
     assert status.has_credential is True
     assert status.matches_saved is False
+
+
+def test_add_without_name_uses_email_alias(manager, credentials, mocker):
+    manager.save("personal", verify=False)
+
+    def authenticate(command, check):
+        credentials.write_colab(make_token("work"))
+        return subprocess.CompletedProcess(command, 0)
+
+    manager.runner.side_effect = authenticate
+    mocker.patch(
+        "colab_account_changer.manager.inspect_token",
+        side_effect=lambda raw, verify: InspectedToken(
+            raw, Identity(email="Alice.W@example.com")
+        ),
+    )
+
+    profile = manager.add()
+
+    assert profile.name == "alice.w"
+    assert credentials.read_profile("alice.w") == make_token("work")

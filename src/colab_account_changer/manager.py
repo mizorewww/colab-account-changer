@@ -775,9 +775,12 @@ class AccountManager:
             self._restore_profile(name, previous, existed=previous is not None)
             raise
 
-    def add(self, name: str, *, verify: bool = True) -> Profile:
-        """Authenticate a new account, restoring the old one on every failure."""
-        name = self._name(name)
+    def add(self, name: str | None = None, *, verify: bool = True) -> Profile:
+        """Authenticate a new account, restoring the old one on every failure.
+
+        Without a name, the alias is derived from the signed-in email.
+        """
+        name = name and self._name(name)
         with self._locked("colab-account add"):
             config = self.config.load()
             if name in config["profiles"]:
@@ -831,6 +834,9 @@ class AccountManager:
                         "Colab authentication did not create an OAuth credential."
                     )
                 inspected = inspect_token(raw, verify=verify)
+                name = name or self._available_alias(
+                    inspected.identity.email or "account", config["profiles"]
+                )
                 self.credentials.write_profile(name, inspected.token_json)
                 created_profile = True
                 if inspected.token_json != raw:
