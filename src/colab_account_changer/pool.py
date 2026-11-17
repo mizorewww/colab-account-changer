@@ -500,13 +500,7 @@ class ColabPool:
     @staticmethod
     def recorded_endpoint(config: str | Path, name: str) -> str | None:
         """Read only the non-secret endpoint of ``name`` from a Colab state file."""
-        try:
-            records = json.loads(Path(config).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        record = records.get(name) if isinstance(records, dict) else None
-        endpoint = record.get("endpoint") if isinstance(record, dict) else None
-        return endpoint if isinstance(endpoint, str) and endpoint else None
+        return ColabPool.read_records(config).get(name)
 
     @classmethod
     def _session(cls, name: str, entry: dict[str, Any]) -> PoolSession:
