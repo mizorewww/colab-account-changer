@@ -920,17 +920,28 @@ class ColabPool:
             else:
                 self._check_limits(selection.account, listed)
             self._activate(selection.account)
-            result = self._colab(config, ["new", "-s", name, *args], capture="stderr")
-            if result.stderr:
-                sys.stderr.write(result.stderr)
-                sys.stderr.flush()
-            endpoint = self.recorded_endpoint(config, name)
             entry = {
                 "account": selection.account,
                 "config": str(config.resolve()),
                 "hardware": hardware_from_args(args),
                 "created_at": _now(),
             }
+            try:
+                result = self._colab(
+                    config, ["new", "-s", name, *args], capture="stderr"
+                )
+            except KeyboardInterrupt:
+                # The VM may already be allocated: keep it managed if recorded.
+                if self.recorded_endpoint(config, name):
+                    self._register(name, entry)
+                self.notify(
+                    f"Interrupted while creating {name!r}; check 'pool reconcile'."
+                )
+                raise
+            if result.stderr:
+                sys.stderr.write(result.stderr)
+                sys.stderr.flush()
+            endpoint = self.recorded_endpoint(config, name)
             if result.returncode != 0 and endpoint is not None:
                 self._release_partial(name, entry, endpoint, result.returncode)
             if endpoint is None:

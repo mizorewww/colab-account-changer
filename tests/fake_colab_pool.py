@@ -76,6 +76,8 @@ def main() -> int:
                     "accelerator": hardware,
                 }
             save()
+            if os.environ.get("FAKE_COLAB_NEW_HANG") == "1":
+                time.sleep(60)
             if os.environ.get("FAKE_COLAB_NEW_FAIL_AFTER_ASSIGN") == "1":
                 print("[colab] Could not start the kernel.", file=sys.stderr)
                 code = 1

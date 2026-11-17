@@ -7,6 +7,7 @@ import contextlib
 import itertools
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -640,6 +641,27 @@ def test_new_failing_after_allocation_releases_the_vm(env):
     assert "node-a" not in env.records("alpha")
     # The same name works on the next attempt.
     created(env, "node-a", "alpha")
+
+
+def test_interrupted_new_registers_an_allocated_vm(env):
+    process = env.pool(
+        "new",
+        "node-a",
+        "--cached",
+        "--account",
+        "alpha",
+        background=True,
+        extra_env={"FAKE_COLAB_NEW_HANG": "1"},
+    )
+    deadline = time.monotonic() + 30
+    while "node-a" not in env.records("alpha") and time.monotonic() < deadline:
+        time.sleep(0.05)
+    process.send_signal(signal.SIGINT)
+    _, stderr = process.communicate(timeout=30)
+
+    assert process.returncode == 130
+    assert "Interrupted while creating 'node-a'" in stderr
+    assert env.registry()["sessions"]["node-a"]["account"] == "alpha"
 
 
 def test_new_failing_after_allocation_registers_vm_it_cannot_release(env):
