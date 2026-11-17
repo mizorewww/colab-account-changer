@@ -462,7 +462,6 @@ class AccountManager:
                     not email
                     and is_active
                     and config["active_profile"]
-                    and self.credentials.read_profile(config["active_profile"])
                     and shares_refresh_token(
                         raw,
                         self.credentials.read_profile(config["active_profile"]),
