@@ -2,8 +2,10 @@
 
 The active account is read from the fake keyring's upstream credential. Server
 assignments live in ``FAKE_COLAB_SERVER`` as {account: {endpoint: hardware}}.
-Like Colab CLI, every per-session command prunes local records whose endpoint
-is not assigned to the *current* account. Every call is logged as JSON lines.
+Like Colab CLI's ``get_session``, a per-session command consults the server
+only for records whose proxy token expires within 5 minutes (or has no
+expiry): it refreshes those still assigned to the *current* account and prunes
+the rest. Every call is logged as JSON lines.
 
 Failure switches (environment variables):
 
@@ -22,6 +24,7 @@ import json
 import os
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import keyring
@@ -107,11 +110,16 @@ def main() -> int:
                     "Shape: Standard | Variant: DEFAULT"
                 )
     else:
+        now = datetime.now(UTC)
         for key in list(records):
-            # Like Colab CLI, 'stop' consults the server only for a record whose
-            # proxy token has no (or a near) expiry, such as a reap placeholder.
-            fresh = subcommand == "stop" and records[key].get("token_expires_at")
-            if records[key]["endpoint"] not in mine and not fresh:
+            expires = records[key].get("token_expires_at")
+            if expires and datetime.fromisoformat(expires) - now > timedelta(minutes=5):
+                continue
+            if records[key]["endpoint"] in mine:
+                records[key]["token_expires_at"] = (
+                    now + timedelta(hours=1)
+                ).isoformat()
+            else:
                 del records[key]
         save()
         if subcommand == "stop":

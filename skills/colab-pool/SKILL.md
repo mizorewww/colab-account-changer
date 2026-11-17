@@ -34,7 +34,8 @@ description: Run Google Colab sessions across several accounts with `colab-pool`
 - Commands on the already-active account (`exec`, `upload`, `download`, `ls`, `status`) share the lock and run concurrently; anything that switches accounts, plus `new`/`stop`/`reap`/`reconcile`/`list`/`stop-all`, is exclusive.
 - `colab-pool status` (no name) shows who holds the lock without waiting.
 - Balance queries (`colab-account usage`, `list --usage`) never wait for the lock.
-- Do not move large files with `upload`/`download`; they hold the lock the whole time. Use Drive or download inside the VM.
+- `exec`, `repl`, `upload`, `download`, `ls`, `rm`, `edit`, `restart-kernel`, and `ssh` (including `--proxy-mode` tunnels, but not `--rm`) hold the lock only while starting (a few seconds); after that they no longer block account switches, `stop`, or `list`. A near-expiry proxy token is refreshed first under the owning account.
+- Other session commands (`status`, `install`, `drivemount`, ...) hold the lock until they finish.
 
 ## Accounts
 
