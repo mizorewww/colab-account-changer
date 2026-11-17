@@ -1241,17 +1241,14 @@ class ColabPool:
             )
         name = validate_session_name(name)
         label = f"{subcommand} {name}"
-        found: list[PoolSession] = []
 
         def owner_is_active() -> bool:
             # Evaluated in the lock queue, so no switch can interleave.
-            session = self.get(name)
-            self._require_account(session.account)
-            found.append(session)
-            return self._is_active(session.account)
+            return self._is_active(self._require_account(self.get(name).account))
 
         with self._access(owner_is_active, label) as mode:
-            session = found[-1] if found else self.get(name)
+            # Any lock mode keeps writers out, so the registration is stable.
+            session = self.get(name)
             if mode == "exclusive":
                 self._require_account(session.account)
                 self._activate(session.account)
