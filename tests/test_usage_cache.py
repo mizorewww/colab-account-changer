@@ -1,9 +1,11 @@
 import json
+import time
 
 import pytest
 from conftest import make_token, refreshed_token
 
 from colab_account_changer.errors import ConfigError
+from colab_account_changer.manager import AccountManager
 from colab_account_changer.storage import ConfigStore
 from colab_account_changer.usage import Usage
 
@@ -118,3 +120,43 @@ def test_invalid_cached_usage_is_rejected(tmp_path):
 
     with pytest.raises(ConfigError, match="usage"):
         ConfigStore(path).load()
+
+
+def test_usage_does_not_wait_or_write_while_busy(manager, credentials, mocker):
+    manager.save("personal", verify=False)
+    manager.usage_service = mocker.Mock()
+    manager.usage_service.fetch.return_value = Usage(12.5, 1.0, 1)
+    before = manager.config.path.read_bytes()
+    active = credentials.read_colab()
+    holder = AccountManager(config_store=manager.config)
+    with holder.exclusive():
+        started = time.monotonic()
+        assert manager.usage("personal") == Usage(12.5, 1.0, 1)
+        assert time.monotonic() - started < 1
+    assert manager.config.path.read_bytes() == before
+    assert credentials.read_colab() == active
+
+
+def test_usage_skips_cache_when_alias_replaced_during_fetch(
+    manager, credentials, mocker
+):
+    manager.save("personal", verify=False)
+
+    def fetch(raw):
+        credentials.write_colab(make_token("different"))
+        manager.save("personal", verify=False, force=True)
+        return Usage(10.0, 1.0, 1)
+
+    manager.usage_service = mocker.Mock()
+    manager.usage_service.fetch.side_effect = fetch
+    assert manager.usage("personal") == Usage(10.0, 1.0, 1)
+    assert "usage" not in manager.config.load()["profiles"]["personal"]
+
+
+def test_usage_with_same_manager_shared_lock_skips_cache(manager, mocker):
+    manager.save("personal", verify=False)
+    manager.usage_service = mocker.Mock()
+    manager.usage_service.fetch.return_value = Usage(10.0, 1.0, 1)
+    with manager.access(can_share=lambda: True):
+        assert manager.usage("personal").balance == 10.0
+    assert "usage" not in manager.config.load()["profiles"]["personal"]

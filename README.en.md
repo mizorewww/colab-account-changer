@@ -31,6 +31,8 @@ colab-account usage
 colab-account usage work
 ```
 
+Usage requests read saved credentials without taking the account lock, so an SSH tunnel or a running `new` command does not block balance queries. Cache updates are best-effort: when the lock is busy, fresh values are displayed without saving them. `list`, `usage`, and `current` also skip automatic credential discovery/import with a warning while busy; run `sync` when the lock is free to import untracked accounts. Network and keyring timeouts still apply.
+
 **Total** sums the balances and consumption rates eligible for aggregation; incomplete coverage is labeled **Known total** instead of treating unknown balances as zero. A live refresh includes only accounts that succeeded and have a saved credential. Old values for failed accounts are marked `stale` / `no credential` and excluded, while `--cached` explicitly aggregates local caches. JSON exposes the same policy through `usage_mode` and per-account `usage_in_total`. **ETA** is the linear estimate `balance ÷ current CU/hr`; a positive balance with a zero rate shows `∞`. The estimate changes with assignments and usage and is not a guaranteed depletion time.
 
 ### 2. Add and switch accounts
@@ -87,6 +89,8 @@ colab-pool reconcile
 # List leftover Colab records that are neither pooled nor on the server; --yes deletes them
 colab-pool prune-state
 ```
+
+`list` waits at most 5 seconds (or a shorter `--lock-timeout`) for server inspection, since inspection may switch accounts. While busy, it still displays account balances and local pool registrations, marks server inspection as incomplete (also in `--json`), and exits 1 rather than presenting unqueried servers as empty. JSON includes `server_inspection.skipped_reason` even when no accounts are registered. `--cached` has the same inspection behavior but uses cached balances.
 
 `stop-all` processes accounts independently, so one failure does not block other instances. It makes at most three passes to handle failures or newly discovered instances. Success is reported only after the server has no instances, every account can be inspected, and local pool registrations are empty; otherwise remaining endpoints/accounts are listed and the command exits nonzero. Background launchers can still create new instances; this command does not kill local processes.
 
