@@ -732,8 +732,13 @@ class AccountManager:
             original = original_keyring or self.credentials.read_legacy()
             original_legacy_only = original_keyring is None and original is not None
             active = config["active_profile"]
+            saved = self.credentials.read_profile(name) or ""
 
-            if original is not None and active == name:
+            if (
+                original is not None
+                and active == name
+                and (save_current or shares_refresh_token(original, saved))
+            ):
                 # Avoid replacing a newly refreshed upstream token with an older copy.
                 if save_current:
                     self._save_unlocked(name, email=None, verify=verify, force=False)

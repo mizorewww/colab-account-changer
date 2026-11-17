@@ -438,3 +438,14 @@ def test_add_refuses_an_already_saved_email(manager, credentials, mocker):
         manager.add()
     assert credentials.read_colab() == make_token("personal")
     assert list(manager.config.load()["profiles"]) == ["personal"]
+
+
+def test_use_no_save_replaces_a_different_login_on_the_active_profile(
+    manager, credentials
+):
+    manager.save("personal", verify=False)
+    credentials.write_colab(make_token("outside"))
+
+    manager.use("personal", save_current=False, discard_unsaved=True, verify=False)
+
+    assert credentials.read_colab() == make_token("personal")
