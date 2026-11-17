@@ -183,43 +183,34 @@ class CredentialStore:
         )
 
     def _call(self, operation: str, *args: str) -> str | None:
-        if operation in {"set_password", "delete_password"}:
-            # A timed-out daemon mutation could finish after rollback and undo it.
-            # Mutations therefore return only after the backend has actually
-            # finished. Read operations retain their timeout protection below.
-            try:
-                return getattr(self.backend, operation)(*args)
-            except PasswordDeleteError:
-                return None
-            except (KeyringError, OSError, RuntimeError) as error:
-                raise CredentialStoreError(
-                    f"Keyring operation failed: {error}"
-                ) from error
-
-        result: list[str | None] = []
-        errors: list[BaseException] = []
+        outcome: list[str | BaseException | None] = []
 
         def invoke() -> None:
             try:
-                result.append(getattr(self.backend, operation)(*args))
+                outcome.append(getattr(self.backend, operation)(*args))
+            except PasswordDeleteError:
+                outcome.append(None)
             except BaseException as exc:  # Re-raised in the calling thread below.
-                errors.append(exc)
+                outcome.append(exc)
 
-        thread = threading.Thread(target=invoke, daemon=True)
-        thread.start()
-        thread.join(self.timeout)
-        if thread.is_alive():
-            raise CredentialStoreError(f"Keyring operation '{operation}' timed out.")
-        if errors:
-            error = errors[0]
-            if isinstance(error, PasswordDeleteError):
-                return None
-            if isinstance(error, (KeyringError, OSError, RuntimeError)):
+        if operation == "get_password":
+            thread = threading.Thread(target=invoke, daemon=True)
+            thread.start()
+            thread.join(self.timeout)
+            if thread.is_alive():
                 raise CredentialStoreError(
-                    f"Keyring operation failed: {error}"
-                ) from error
-            raise error
-        return result[0]
+                    f"Keyring operation '{operation}' timed out."
+                )
+        else:
+            # A timed-out daemon mutation could finish after rollback and undo
+            # it, so mutations return only once the backend has finished.
+            invoke()
+        value = outcome[0]
+        if isinstance(value, (KeyringError, OSError, RuntimeError)):
+            raise CredentialStoreError(f"Keyring operation failed: {value}") from value
+        if isinstance(value, BaseException):
+            raise value
+        return value
 
     def read_keyring_colab(self) -> str | None:
         return self._call("get_password", COLAB_SERVICE, COLAB_USERNAME)
