@@ -17,7 +17,9 @@ from conftest import make_token
 from filelock import FileLock
 
 from colab_account_changer.errors import AccountError
+from colab_account_changer.manager import AccountManager
 from colab_account_changer.pool import ColabPool, hardware_from_args, snapshot_json
+from colab_account_changer.storage import ConfigStore
 from colab_account_changer.tokens import token_fingerprint
 from colab_account_changer.usage import Usage
 
@@ -836,6 +838,7 @@ def test_list_json_and_table(env):
         "accounts_succeeded": 2,
         "complete": True,
         "errors": {},
+        "skipped_reason": None,
     }
     accounts = {account["name"]: account for account in snapshot["accounts"]}
     assert accounts["alpha"]["pool_sessions"] == 1
@@ -1493,3 +1496,38 @@ def test_mismatched_upstream_credential_is_not_used(env):
     assert result.returncode == 1
     assert "no longer matches profile 'alpha'" in result.stderr
     assert [call["subcommand"] for call in env.calls()] == ["sessions", "new"]
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_pool_list_shows_balances_when_busy(env, as_json):
+    holder = AccountManager(config_store=ConfigStore(env.config))
+    before = (env.config.read_bytes(), env.keyring.read_bytes())
+    args = ["list"] + (["--json"] if as_json else [])
+    with holder.access(can_share=lambda: True):
+        result = env.pool("--lock-timeout", "0", *args)
+    assert result.returncode == 1, result.stderr
+    assert result.stderr.count("skipped server inspection") == 1
+    if as_json:
+        data = json.loads(result.stdout)
+        assert data["total"]["balance"] == 200.0
+        assert data["server_inspection"]["complete"] is False
+        assert data["server_inspection"]["accounts"] == []
+        assert data["server_inspection"]["errors"] == {}
+        assert data["server_inspection"]["skipped_reason"]
+        assert data["lock_holders"][0]["mode"] == "shared"
+    else:
+        assert "200.00" in result.stdout
+        assert "Lock holders" in result.stderr
+    assert (env.config.read_bytes(), env.keyring.read_bytes()) == before
+    assert env.calls() == []
+
+
+def test_empty_pool_busy_inspection_is_incomplete(env):
+    env.seed({}, active=None)
+    holder = AccountManager(config_store=ConfigStore(env.config))
+    with holder.exclusive():
+        result = env.pool("--lock-timeout", "0", "list", "--json")
+    assert result.returncode == 1, result.stderr
+    inspection = json.loads(result.stdout)["server_inspection"]
+    assert inspection["complete"] is False
+    assert inspection["skipped_reason"]

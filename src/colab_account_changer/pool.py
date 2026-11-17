@@ -38,6 +38,7 @@ from filelock import ReadWriteLock, Timeout
 from colab_account_changer.errors import (
     AccountChangerError,
     ConfigError,
+    LockTimeoutError,
     PoolCapacityError,
     PoolError,
 )
@@ -49,6 +50,8 @@ from colab_account_changer.usage import Usage, total_usage
 DEFAULT_THRESHOLD = 5.0
 DEFAULT_LOCK_TIMEOUT = 600.0
 DEFAULT_LOCK_WARN_AFTER = 120.0
+INSPECTION_LOCK_GRACE = 5.0
+BUSY_INSPECTION = "Account lock is busy; skipped server inspection."
 # Conservative caps against runaway "retry pool new" loops; see 'pool limits'.
 # The pool runs one primary account at a time, so the per-account cap is what
 # the pool can really open; the pool-wide cap leaves room for leftovers on
@@ -260,6 +263,11 @@ class ReconcileReport:
     server: list[ServerSession] = field(default_factory=list)
     vanished: list[PoolSession] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)
+    skipped_reason: str | None = None
+
+    @property
+    def complete(self) -> bool:
+        return self.skipped_reason is None and not self.errors
 
     @property
     def orphans(self) -> list[ServerSession]:
@@ -267,7 +275,7 @@ class ReconcileReport:
 
     @property
     def consistent(self) -> bool:
-        return not (self.orphans or self.vanished or self.errors)
+        return self.complete and not (self.orphans or self.vanished)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -277,6 +285,7 @@ class ReconcileReport:
             "orphans": [asdict(entry) for entry in self.orphans],
             "vanished": [asdict(entry) for entry in self.vanished],
             "errors": self.errors,
+            "skipped_reason": self.skipped_reason,
         }
 
 
@@ -739,17 +748,24 @@ class ColabPool:
             return self.limits(registry)
 
     def refresh_usage(self, accounts: Iterable[str] | None = None) -> dict[str, str]:
-        """Refresh cached usage; the caller must hold the lock. Returns errors."""
+        """Refresh usage, caching when possible. Returns per-account errors."""
+        _, errors = self._fetch_usage(accounts)
+        return errors
+
+    def _fetch_usage(
+        self, accounts: Iterable[str] | None = None
+    ) -> tuple[dict[str, Usage], dict[str, str]]:
         profiles = self._profiles()
+        values: dict[str, Usage] = {}
         errors: dict[str, str] = {}
         for name in sorted(accounts if accounts is not None else profiles):
             if self.manager.credentials.read_profile(name) is None:
                 continue
             try:
-                self.manager.usage(name)
+                values[name] = self.manager.usage(name)
             except AccountChangerError as exc:
                 errors[name] = str(exc)
-        return errors
+        return values, errors
 
     def _select(self, refresh_failed: Iterable[str] = ()) -> Selection:
         """Single-account policy: stay on the primary account.
@@ -1669,25 +1685,42 @@ class ColabPool:
 
     # Overview -----------------------------------------------------------
 
+    def overview(self, *, refresh: bool = True) -> tuple[ReconcileReport, Snapshot]:
+        try:
+            # Server inspection switches credentials; balances do not need it.
+            with self.manager.exclusive(
+                timeout=min(self.lock_timeout, INSPECTION_LOCK_GRACE), label="pool list"
+            ):
+                report = self.reconcile(all_accounts=True, refresh=False)
+        except LockTimeoutError:
+            report = ReconcileReport(accounts=[], skipped_reason=BUSY_INSPECTION)
+        return report, self.snapshot(refresh=refresh)
+
     def snapshot(self, *, refresh: bool = True) -> Snapshot:
-        errors: dict[str, str] = {}
-        if refresh:
-            with self.hold("list"):
-                errors = self.refresh_usage()
-        registry = self.store.load()
         config = self.manager.config.load()
+        errors: dict[str, str] = {}
+        values: dict[str, Usage] = {}
+        fetched_at = None
+        if refresh:
+            values, errors = self._fetch_usage()
+            fetched_at = _now()
+        registry = self.store.load()
         sessions = self.sessions()
         counts: dict[str, int] = {}
         for session in sessions:
             counts[session.account] = counts.get(session.account, 0) + 1
         accounts = []
-        for profile in self.manager.profiles():
+        for profile in self.manager.profiles(config=config):
             accounts.append(
                 AccountState(
                     name=profile.name,
                     email=profile.email,
-                    usage=profile.usage,
-                    usage_fetched_at=profile.usage_fetched_at,
+                    usage=values.get(profile.name, profile.usage),
+                    usage_fetched_at=(
+                        fetched_at
+                        if profile.name in values
+                        else profile.usage_fetched_at
+                    ),
                     stored=profile.stored,
                     sessions=counts.get(profile.name, 0),
                     is_primary=profile.name == registry["primary"],
@@ -1777,7 +1810,8 @@ def snapshot_json(
             "accounts": server_report.accounts,
             "accounts_succeeded": len(server_report.accounts)
             - len(server_report.errors),
-            "complete": not server_report.errors,
+            "complete": server_report.complete,
             "errors": server_report.errors,
+            "skipped_reason": server_report.skipped_reason,
         }
     return result

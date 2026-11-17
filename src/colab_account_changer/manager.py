@@ -344,10 +344,10 @@ class AccountManager:
         )
 
     def discover(
-        self, *, verify: bool = True, include_gcloud: bool = True
+        self, *, verify: bool = True, include_gcloud: bool = True, timeout: float = 10.0
     ) -> DiscoveryResult:
         """Import existing keyring/legacy tokens without changing Colab's login."""
-        with self._locked("colab-account discover"):
+        with self.exclusive(timeout=timeout, label="colab-account discover"):
             discovered: list[Profile] = []
             imported: list[Profile] = []
             errors: list[str] = []
@@ -533,8 +533,8 @@ class AccountManager:
         except (OSError, subprocess.SubprocessError, ValueError, TypeError):
             return []
 
-    def profiles(self) -> list[Profile]:
-        config = self.config.load()
+    def profiles(self, *, config: dict[str, Any] | None = None) -> list[Profile]:
+        config = self.config.load() if config is None else config
         return [
             self._profile(
                 name,
@@ -558,31 +558,39 @@ class AccountManager:
         return CurrentStatus(active, email, True, saved == raw)
 
     def usage(self, name: str | None = None) -> Usage:
-        """Fetch and cache usage without modifying the active credential."""
-        with self._locked("colab-account usage"):
-            config = self.config.load()
-            name = name or config["active_profile"]
-            if name is None:
-                raw = self.credentials.read_colab()
-                if raw is None:
-                    raise AccountError("No active Colab OAuth credential was found.")
-                return self.usage_service.fetch(raw)
-            name = self._name(name)
-            if name not in config["profiles"]:
-                raise AccountError(f"Profile {name!r} does not exist.")
-            raw = self.credentials.read_profile(name)
+        """Fetch without the account lock; cache only when it is available."""
+        config = self.config.load()
+        name = name or config["active_profile"]
+        if name is None:
+            raw = self.credentials.read_colab()
             if raw is None:
-                raise AccountError(f"Profile {name!r} has no saved credential.")
-            usage = self.usage_service.fetch(raw)
-            updated = copy.deepcopy(config)
-            updated["profiles"][name]["usage"] = {
-                "balance": usage.balance,
-                "hourly_rate": usage.hourly_rate,
-                "assignments": usage.assignments,
-                "fetched_at": self._now(),
-            }
-            self.config.save(updated)
-            return usage
+                raise AccountError("No active Colab OAuth credential was found.")
+            return self.usage_service.fetch(raw)
+        name = self._name(name)
+        if name not in config["profiles"]:
+            raise AccountError(f"Profile {name!r} does not exist.")
+        raw = self.credentials.read_profile(name)
+        if raw is None:
+            raise AccountError(f"Profile {name!r} has no saved credential.")
+        usage = self.usage_service.fetch(raw)
+        # A shared tunnel cannot upgrade its lock. Other readers can skip this
+        # optional write instead of waiting behind a tunnel or queued writer.
+        if self.lock_mode != "shared":
+            with suppress(LockTimeoutError), self.exclusive(
+                timeout=0, label="colab-account usage cache"
+            ):
+                updated = self.config.load()
+                metadata = updated["profiles"].get(name)
+                # The alias may have been removed or replaced during the fetch.
+                if metadata and metadata["token_sha256"] == token_fingerprint(raw):
+                    metadata["usage"] = {
+                        "balance": usage.balance,
+                        "hourly_rate": usage.hourly_rate,
+                        "assignments": usage.assignments,
+                        "fetched_at": self._now(),
+                    }
+                    self.config.save(updated)
+        return usage
 
     def save(
         self,

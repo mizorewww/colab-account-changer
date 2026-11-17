@@ -15,7 +15,7 @@ from rich.table import Table
 from rich.text import Text
 
 from colab_account_changer import __version__
-from colab_account_changer.errors import AccountChangerError
+from colab_account_changer.errors import AccountChangerError, LockTimeoutError
 from colab_account_changer.manager import AccountManager, DiscoveryResult, Profile
 from colab_account_changer.pool_cli import pool_app
 from colab_account_changer.usage import Usage, format_eta, total_usage
@@ -80,9 +80,26 @@ def root(
 
 
 def _discover(
-    manager: AccountManager, *, offline: bool, include_gcloud: bool
+    manager: AccountManager,
+    *,
+    offline: bool,
+    include_gcloud: bool,
+    best_effort: bool = False,
 ) -> DiscoveryResult:
-    result = manager.discover(verify=not offline, include_gcloud=include_gcloud)
+    options = {"timeout": 0.0} if best_effort else {}
+    try:
+        result = manager.discover(
+            verify=not offline, include_gcloud=include_gcloud, **options
+        )
+    except LockTimeoutError:
+        if not best_effort:
+            raise
+        error_console.print(
+            "Account lock is busy; skipped credential discovery/import. "
+            "Using saved profiles only; run sync when the lock is free.",
+            style="yellow",
+        )
+        return DiscoveryResult(profiles=[], imported=[], gcloud_accounts=[], errors=[])
     for message in result.errors:
         error_console.print(
             Panel(Text(message), title="Discovery warning", border_style="yellow")
@@ -234,7 +251,9 @@ def list_accounts(
     discovery = (
         None
         if no_discover
-        else _discover(manager, offline=offline, include_gcloud=True)
+        else _discover(
+            manager, offline=offline, include_gcloud=True, best_effort=True
+        )
     )
     _render_accounts(
         manager,
@@ -264,13 +283,11 @@ def usage(
 ) -> None:
     """Show live compute-unit balance and rate without switching accounts."""
     manager = AccountManager()
-    _discover(manager, offline=False, include_gcloud=False)
-    value = manager.usage(name)
+    _discover(manager, offline=False, include_gcloud=False, best_effort=True)
     config = manager.config.load()
     profile_name = name or config["active_profile"]
-    email = (
-        config["profiles"].get(profile_name, {}).get("email") if profile_name else None
-    )
+    email = config["profiles"].get(profile_name, {}).get("email")
+    value = manager.usage(profile_name)
     details = Table.grid(padding=(0, 2))
     details.add_column(style="bold")
     details.add_column()
@@ -288,7 +305,7 @@ def usage(
 def current() -> None:
     """Show the current local profile without contacting Google."""
     manager = AccountManager()
-    _discover(manager, offline=True, include_gcloud=False)
+    _discover(manager, offline=True, include_gcloud=False, best_effort=True)
     status = manager.status()
     if not status.has_credential:
         console.print(

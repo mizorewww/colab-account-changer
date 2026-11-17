@@ -6,8 +6,8 @@ from typer.testing import CliRunner
 
 from colab_account_changer import __version__
 from colab_account_changer.cli import app, main
-from colab_account_changer.errors import AccountError, ConfigError
-from colab_account_changer.manager import Profile
+from colab_account_changer.errors import AccountError, ConfigError, LockTimeoutError
+from colab_account_changer.manager import AccountManager, Profile
 from colab_account_changer.tokens import Identity, InspectedToken
 from colab_account_changer.usage import Usage
 
@@ -272,3 +272,27 @@ def test_main_handles_ctrl_c(mocker, capsys):
 
     assert exit_info.value.code == 130
     assert "Cancelled" in capsys.readouterr().err
+
+
+def test_read_commands_skip_discovery_when_busy(cli_manager, mocker):
+    cli_manager.save("personal", verify=False)
+    cli_manager.usage_service = mocker.Mock()
+    cli_manager.usage_service.fetch.return_value = Usage(12.5, 1.0, 1)
+    holder = AccountManager(config_store=cli_manager.config)
+    with holder.exclusive():
+        for args in (["list", "--usage"], ["usage", "personal"], ["current"]):
+            result = runner.invoke(app, args)
+            assert result.exit_code == 0, result.output
+            assert "personal" in result.stdout
+            assert "skipped credential discovery/import" in result.stderr
+
+
+def test_mutating_commands_keep_strict_discovery(cli_manager, mocker):
+    discover = mocker.patch.object(
+        cli_manager, "discover", side_effect=LockTimeoutError("busy")
+    )
+    for args in (["sync"], ["add", "other"], ["use", "personal"]):
+        result = runner.invoke(app, [*args, "--offline"])
+        assert isinstance(result.exception, LockTimeoutError)
+        assert discover.call_args.kwargs.get("timeout", 10) > 0
+    cli_manager.runner.assert_not_called()
