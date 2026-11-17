@@ -262,6 +262,8 @@ def test_arguments_stdin_and_exit_code_pass_through(env):
     assert result.returncode == 3
     assert "args=['-f', 'a.py', '--timeout', '5', '--help']" in result.stdout
     assert "stdin=exit:3" in result.stdout
+    killed = env.pool("exec", "node-x", input=f"signal:{signal.SIGTERM.value}")
+    assert killed.returncode == 128 + signal.SIGTERM.value
 
     piped = env.pool("exec", "node-x", input="print('hi')\n")
     assert piped.returncode == 0

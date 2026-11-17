@@ -144,6 +144,8 @@ def main() -> int:
             print(f"{subcommand} {name} on {account} args={rest} stdin={data.strip()}")
             if data.startswith("exit:"):
                 code = int(data.split(":", 1)[1])
+            if data.startswith("signal:"):
+                os.kill(os.getpid(), int(data.split(":", 1)[1]))
 
     with Path(os.environ["FAKE_COLAB_LOG"]).open("a") as log:
         log.write(

@@ -1240,9 +1240,9 @@ class ColabPool:
         """Run ``colab <subcommand> -s NAME ...`` under the owning account.
 
         Standard input, output, and error are inherited, so pipes work and the
-        Colab exit code is returned unchanged. If Colab prunes the local record
-        after a terminal error, a confirmed server-side loss is also removed
-        from the pool registry.
+        Colab exit code is returned (128 + N when killed by signal N). If Colab
+        prunes the local record after a terminal error, a confirmed server-side
+        loss is also removed from the pool registry.
         """
         if subcommand in {"new", "stop", "sessions", "run"}:
             raise PoolError(
@@ -1279,7 +1279,8 @@ class ColabPool:
                     and entry["config"] == session.config
                 ):
                     self._handle_pruned_session(session)
-        return result.returncode
+        # A child killed by signal N reports -N; shells expect 128 + N.
+        return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
     def _is_active(self, account: str) -> bool:
         """Whether ``account`` is active and needs no switch or repair.
