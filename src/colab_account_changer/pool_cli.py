@@ -23,7 +23,7 @@ from colab_account_changer.pool import (
     snapshot_json,
     snapshot_usages,
 )
-from colab_account_changer.usage import format_eta, total_usage
+from colab_account_changer.usage import format_eta, format_total
 
 console = Console()
 error_console = Console(stderr=True)
@@ -346,21 +346,7 @@ def list_pool(
                 )
             )
     _disabled_hint(pool)
-    usages = snapshot_usages(snapshot)
-    total = total_usage(usages)
-    if total is None:
-        console.print("[dim]Total CU: — (no usage data)[/dim]")
-    else:
-        known = sum(usage is not None for usage in usages)
-        label = (
-            "Total"
-            if known == len(usages)
-            else f"Known total ({known}/{len(usages)} accounts)"
-        )
-        console.print(
-            f"[bold]{label}:[/bold] {total.balance:.2f} CU  |  "
-            f"{total.hourly_rate:.2f} CU/hr  |  ETA {format_eta(total)} hr"
-        )
+    console.print(format_total(snapshot_usages(snapshot)))
     console.print(
         f"[dim]★ Primary ({escape(snapshot.primary or 'unset')}; switch below "
         f"{snapshot.threshold:g} CU)  ● Active Colab account[/dim]"

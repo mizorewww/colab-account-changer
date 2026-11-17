@@ -55,6 +55,23 @@ def total_usage(usages: Iterable[Usage | None]) -> Usage | None:
     )
 
 
+def format_total(usages: list[Usage | None]) -> str:
+    """One Rich-markup line with the (known) total balance, rate, and ETA."""
+    total = total_usage(usages)
+    if total is None:
+        return "[dim]Total CU: — (no usage data)[/dim]"
+    known = sum(usage is not None for usage in usages)
+    label = (
+        "Total"
+        if known == len(usages)
+        else f"Known total ({known}/{len(usages)} accounts)"
+    )
+    return (
+        f"[bold]{label}:[/bold] {total.balance:.2f} CU  |  "
+        f"{total.hourly_rate:.2f} CU/hr  |  ETA {format_eta(total)} hr"
+    )
+
+
 class UsageService:
     """Query usage directly with a profile token, without switching accounts."""
 

@@ -18,7 +18,7 @@ from colab_account_changer import __version__
 from colab_account_changer.errors import AccountChangerError, LockTimeoutError
 from colab_account_changer.manager import AccountManager, DiscoveryResult, Profile
 from colab_account_changer.pool_cli import pool_app
-from colab_account_changer.usage import Usage, format_eta, total_usage
+from colab_account_changer.usage import format_eta, format_total
 
 console = Console()
 error_console = Console(stderr=True)
@@ -125,23 +125,6 @@ def _cache_age(timestamp: str | None) -> str:
     return f"{seconds // 86400}d ago"
 
 
-def _print_usage_total(usages: list[Usage | None]) -> None:
-    total = total_usage(usages)
-    if total is None:
-        console.print("[dim]Total CU: — (no usage data)[/dim]")
-        return
-    known = sum(usage is not None for usage in usages)
-    label = (
-        "Total"
-        if known == len(usages)
-        else f"Known total ({known}/{len(usages)} accounts)"
-    )
-    console.print(
-        f"[bold]{label}:[/bold] {total.balance:.2f} CU  |  "
-        f"{total.hourly_rate:.2f} CU/hr  |  ETA {format_eta(total)} hr"
-    )
-
-
 def _render_accounts(
     manager: AccountManager,
     *,
@@ -206,7 +189,7 @@ def _render_accounts(
             ]
             table.add_row(*row)
         console.print(table)
-        _print_usage_total(list(displayed_usage.values()))
+        console.print(format_total(list(displayed_usage.values())))
         console.print(
             "[dim]● Active profile. Usage is cached; use --usage to refresh. "
             "ETA = balance ÷ current rate.[/dim]"
